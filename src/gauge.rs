@@ -16,6 +16,8 @@ pub const CATEGORIES_COLLECTION: &str = "categories";
 pub const BASELINES_COLLECTION: &str = "baselines";
 pub const BASELINE_IMAGES_COLLECTION: &str = "baseline_images";
 pub const EVALUATIONS_COLLECTION: &str = "evaluations";
+/// Generated baselines' full HTML documents, keyed by baseline id.
+pub const BASELINE_HTML_COLLECTION: &str = "baseline_html";
 pub const ENGINE_COLLECTION: &str = "engine";
 
 pub const EVALUATIONS_CAP: usize = 100;
@@ -61,6 +63,29 @@ pub struct Baseline {
     pub mime_type: String,
     #[serde(default)]
     pub created_at: String,
+    /// "image" (user-uploaded screenshot) or "generated" (agent-produced
+    /// HTML, stored in `baseline_html/<id>`). Default keeps 0.1.0 data valid.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// Generated baselines: what this iteration changed vs the previous ones
+    /// — the directive that graduates into the overall prompt when the user
+    /// rates the result high.
+    #[serde(default)]
+    pub change_prompt: String,
+}
+
+fn default_kind() -> String {
+    "image".into()
+}
+
+impl Baseline {
+    /// Mean of the user's category rankings; None while unrated.
+    pub fn avg_score(&self) -> Option<f64> {
+        if self.scores.is_empty() {
+            return None;
+        }
+        Some(self.scores.values().map(|s| *s as f64).sum::<f64>() / self.scores.len() as f64)
+    }
 }
 
 // ── Store access (same envelope as the other Rust plugins) ────────────
@@ -261,6 +286,115 @@ pub fn new_id(prefix: &str) -> String {
     format!("{prefix}-{compact}-{n:04}")
 }
 
+// ── Overall baseline prompt + the generation loop (0.2.0) ──────────
+
+/// A generated baseline whose average user rating clears this graduates its
+/// `change_prompt` into the overall prompt.
+pub const HIGH_AVG: f64 = 7.0;
+/// At or below this, the change is listed as something to avoid when
+/// generating the next iteration.
+pub const LOW_AVG: f64 = 4.0;
+/// Generated HTML cap — stays under the 256 KB store-document ceiling.
+pub const HTML_MAX_LEN: usize = 180_000;
+
+/// The living "overall baseline prompt": the style directives the user has
+/// validated, assembled from every high-rated generated baseline's
+/// `change_prompt` (oldest → newest, so later refinements read last). Pure
+/// and computed on read — it can never go stale: re-rating or deleting a
+/// baseline changes the very next read.
+pub fn overall_prompt(baselines: &[Baseline]) -> String {
+    let mut proven: Vec<String> = Vec::new();
+    for b in baselines {
+        if b.kind != "generated" || b.change_prompt.trim().is_empty() {
+            continue;
+        }
+        if let Some(avg) = b.avg_score()
+            && avg >= HIGH_AVG
+        {
+            proven.push(format!("- [rated {avg:.1}/10] {}", b.change_prompt.trim()));
+        }
+    }
+    let mut out = String::from(
+        "# Overall UI baseline prompt\n\
+         Style directives the user has validated by rating generated baselines \
+         7+/10. Apply ALL of them when designing or judging UI for this user.\n",
+    );
+    if proven.is_empty() {
+        out.push_str("\n(No validated directives yet — generate baselines and rate them.)\n");
+    } else {
+        out.push('\n');
+        out.push_str(&proven.join("\n"));
+        out.push('\n');
+    }
+    out
+}
+
+/// The prompt handed to a generation session: the validated overall prompt,
+/// what to improve on, what to avoid, and the submission contract.
+pub fn build_generation_prompt(baselines: &[Baseline]) -> String {
+    let generated: Vec<&Baseline> = baselines.iter().filter(|b| b.kind == "generated").collect();
+    let mut keep = Vec::new();
+    let mut avoid = Vec::new();
+    let mut unrated = 0usize;
+    for b in generated.iter().rev().take(10) {
+        match b.avg_score() {
+            Some(avg) if avg >= HIGH_AVG => {
+                keep.push(format!("- [{avg:.1}/10] {}", b.change_prompt.trim()))
+            }
+            Some(avg) if avg <= LOW_AVG => {
+                avoid.push(format!("- [{avg:.1}/10] {}", b.change_prompt.trim()))
+            }
+            Some(_) => {}
+            None => unrated += 1,
+        }
+    }
+    let mut p = String::from(
+        "Generate ONE self-contained baseline UI page: a realistic, polished dashboard-style \
+         screen (invent plausible content) as a single HTML document with ALL CSS inlined in a \
+         <style> tag. No external resources, no JavaScript — it is rendered statically in a \
+         sandboxed frame for the user to rate 1-10 per design category.\n\n",
+    );
+    p.push_str(&overall_prompt(baselines));
+    if !avoid.is_empty() {
+        p.push_str("\n## The user rated these changes LOW — avoid repeating them\n");
+        p.push_str(&avoid.join("\n"));
+        p.push('\n');
+    }
+    if unrated > 0 {
+        p.push_str(&format!(
+            "\n({unrated} earlier generated baseline(s) are still unrated — vary a different \
+             aspect rather than re-testing the same idea.)\n"
+        ));
+    }
+    let _ = keep; // already embedded via overall_prompt
+    p.push_str(
+        "\n## Your task\n\
+         1. Improve on the previous baselines: keep every validated directive above, then \
+         change or refine ONE clear aspect (layout rhythm, type scale, color system, density, \
+         component styling, …) that could raise the user's ratings.\n\
+         2. Submit EXACTLY ONE result by calling the ui_gauge_submit_baseline tool with:\n\
+         - html: the complete HTML document (≤ 180000 chars)\n\
+         - change_summary: one short paragraph of WHAT you changed vs the previous baselines \
+         and why — written as a reusable style directive (it becomes part of the overall \
+         prompt if the user rates it high)\n\
+         - name: a short title for this iteration\n\
+         Do not ask questions; do not produce anything else.",
+    );
+    p
+}
+
+// ── Generation state (engine/generation) ────────────────────────
+
+pub fn generation_state() -> Value {
+    store_get(ENGINE_COLLECTION, "generation")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| json!({ "status": "idle" }))
+}
+
+pub fn set_generation_state(v: Value) {
+    let _ = store_put(ENGINE_COLLECTION, "generation", v);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +415,8 @@ mod tests {
             scores: scores.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             mime_type: "image/png".into(),
             created_at: String::new(),
+            kind: "image".into(),
+            change_prompt: String::new(),
         }
     }
 
@@ -327,5 +463,70 @@ mod tests {
         let cats = default_categories();
         assert_eq!(cats.len(), 6);
         assert!(cats.iter().any(|c| c.key == "accessibility"));
+    }
+
+    fn generated(change: &str, scores: &[(&str, u8)], ts: &str) -> Baseline {
+        Baseline {
+            id: ts.into(),
+            name: "gen".into(),
+            notes: String::new(),
+            scores: scores.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            mime_type: String::new(),
+            created_at: ts.into(),
+            kind: "generated".into(),
+            change_prompt: change.into(),
+        }
+    }
+
+    #[test]
+    fn avg_score_none_until_rated() {
+        let b = generated("x", &[], "1");
+        assert!(b.avg_score().is_none());
+        let b = generated("x", &[("a", 6), ("b", 9)], "1");
+        assert_eq!(b.avg_score(), Some(7.5));
+    }
+
+    #[test]
+    fn overall_prompt_keeps_only_high_rated_generated_changes() {
+        let bs = vec![
+            generated("tighter spacing", &[("a", 8), ("b", 8)], "1"), // 8.0 → in
+            generated("neon palette", &[("a", 3), ("b", 4)], "2"),    // 3.5 → out
+            generated("bigger type scale", &[], "3"),                 // unrated → out
+            base(&[("a", 10)]),                                       // image kind → out
+        ];
+        let p = overall_prompt(&bs);
+        assert!(p.contains("tighter spacing"), "{p}");
+        assert!(p.contains("[rated 8.0/10]"), "{p}");
+        assert!(!p.contains("neon palette"), "{p}");
+        assert!(!p.contains("bigger type scale"), "{p}");
+    }
+
+    #[test]
+    fn overall_prompt_updates_when_a_rating_changes() {
+        let mut bs = vec![generated("card shadows", &[("a", 5)], "1")];
+        assert!(!overall_prompt(&bs).contains("card shadows"));
+        bs[0].scores.insert("a".into(), 9);
+        assert!(
+            overall_prompt(&bs).contains("card shadows"),
+            "re-rating must refresh"
+        );
+        bs.clear();
+        assert!(overall_prompt(&bs).contains("No validated directives"));
+    }
+
+    #[test]
+    fn generation_prompt_carries_overall_avoid_and_contract() {
+        let bs = vec![
+            generated("tighter spacing", &[("a", 8)], "1"),
+            generated("neon palette", &[("a", 2)], "2"),
+            generated("glass morphism", &[], "3"),
+        ];
+        let p = build_generation_prompt(&bs);
+        assert!(p.contains("tighter spacing"), "{p}");
+        assert!(p.contains("avoid repeating"), "{p}");
+        assert!(p.contains("neon palette"), "{p}");
+        assert!(p.contains("still unrated"), "{p}");
+        assert!(p.contains("ui_gauge_submit_baseline"), "{p}");
+        assert!(p.contains("change_summary"), "{p}");
     }
 }

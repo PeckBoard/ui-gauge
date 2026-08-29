@@ -70,6 +70,27 @@ fn dispatch_hook(hook: &str, payload: serde_json::Value) -> String {
             }
             skip()
         }
+        // A generation session that ends without ever submitting a baseline
+        // flips the pending generation to "ended" so the page can say so
+        // (a successful submit already set it to "done").
+        "session.agent.ended" => {
+            let ended = payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let generation = gauge::generation_state();
+            if !ended.is_empty()
+                && generation.get("status").and_then(|s| s.as_str()) == Some("running")
+                && generation.get("session_id").and_then(|s| s.as_str()) == Some(ended)
+            {
+                gauge::set_generation_state(serde_json::json!({
+                    "status": "ended",
+                    "session_id": ended,
+                    "finished_at": gauge::clock(),
+                }));
+            }
+            skip()
+        }
         "http.request.before" => match page::serve_public(payload) {
             Ok(resp) => allow(resp),
             Err(e) => cancel(&e),
@@ -98,6 +119,7 @@ fn handle_invoke(payload: serde_json::Value) -> String {
         "ui_gauge_baseline_image" => tools::baseline_image_tool(args),
         "ui_gauge_score" => tools::score_tool(args),
         "ui_gauge_history" => tools::history_tool(args),
+        "ui_gauge_submit_baseline" => tools::submit_baseline_tool(args),
         other => return cancel(&format!("ui-gauge does not provide tool '{other}'")),
     };
 

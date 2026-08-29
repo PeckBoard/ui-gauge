@@ -16,6 +16,8 @@ pub fn manifest_json() -> String {
             // Clock only — wasm has no time source; evaluations are stamped
             // with the last tick's timestamp.
             "timer.tick",
+            // Marks a generation session that ended without submitting.
+            "session.agent.ended",
             "http.request.before",
             "http.request.authed",
         ],
@@ -24,7 +26,7 @@ pub fn manifest_json() -> String {
             {
                 "name": "ui_gauge_rubric",
                 "title": "UI-gauge rubric + calibration anchors",
-                "description": "The user's UI design rubric: categories with their 1-10 bars, and the user's ranked baseline screenshots (scores + notes; fetch images with ui_gauge_baseline_image). Call this BEFORE scoring any UI so your numbers sit on the user's calibrated scale, then score the target and submit via ui_gauge_score.",
+                "description": "The user's UI design rubric: categories with their 1-10 bars, the user's ranked baselines (scores + notes + change prompts; fetch images with ui_gauge_baseline_image), and the OVERALL BASELINE PROMPT — the style directives the user has validated by rating generated baselines high. Call this BEFORE scoring any UI so your numbers sit on the user's calibrated scale, and apply the overall prompt whenever you BUILD UI for this user.",
                 "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }
             },
             {
@@ -71,6 +73,21 @@ pub fn manifest_json() -> String {
                     "required": [],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "ui_gauge_submit_baseline",
+                "title": "Submit a generated baseline UI",
+                "description": "Submit ONE generated baseline UI iteration: a complete self-contained HTML document (all CSS inline, no JavaScript, no external resources, max 180000 chars) plus a change_summary — one short paragraph describing WHAT changed vs the previous baselines, written as a reusable style directive. The user rates the result 1-10 per category on the UI Gauge page; an average of 7+ folds your change_summary into the user's overall baseline prompt. Used by the page's Generate-baseline sessions; callable by any agent iterating on baseline UI.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "html": { "type": "string", "description": "The complete HTML document (inline CSS, no JS, ≤180000 chars)." },
+                        "change_summary": { "type": "string", "description": "What this iteration changed vs previous baselines and why — phrased as a reusable style directive." },
+                        "name": { "type": "string", "description": "Short title for this iteration." }
+                    },
+                    "required": ["html", "change_summary"],
+                    "additionalProperties": false
+                }
             }
         ],
 
@@ -80,18 +97,24 @@ pub fn manifest_json() -> String {
         "http_routes": ["GET /plugin-api/v1/ui-gauge"],
         "ui_routes": [
             "GET /api/plugin-ui/ui-gauge/state",
+            "GET /api/plugin-ui/ui-gauge/pickers",
             "POST /api/plugin-ui/ui-gauge/categories",
+            "POST /api/plugin-ui/ui-gauge/generate",
             "POST /api/plugin-ui/ui-gauge/baselines",
             "POST /api/plugin-ui/ui-gauge/baselines/:id",
             "POST /api/plugin-ui/ui-gauge/baselines/:id/delete",
-            "GET /api/plugin-ui/ui-gauge/baselines/:id/image"
+            "GET /api/plugin-ui/ui-gauge/baselines/:id/image",
+            "GET /api/plugin-ui/ui-gauge/baselines/:id/html"
         ],
 
         "permissions": [
             "provide_mcp_tools",
-            "data_store",          // rubric, baselines, evaluation history
+            "data_store",          // rubric, baselines, generated html, history
             "user_authority",      // authed page routes
-            "contribute_sidebar"   // the UI Gauge sidebar entry
+            "contribute_sidebar",  // the UI Gauge sidebar entry
+            "session_write",       // create the temp generation session
+            "session_dispatch",    // hand it the generation prompt
+            "models_read"          // the model picker
         ],
     });
     manifest.to_string()
@@ -115,6 +138,7 @@ mod tests {
             "ui_gauge_baseline_image",
             "ui_gauge_score",
             "ui_gauge_history",
+            "ui_gauge_submit_baseline",
         ] {
             assert!(tools.contains(&t), "missing tool {t}");
         }

@@ -1,13 +1,19 @@
-//! The UI Gauge page: baseline gallery with 1-10 ranking sliders, the
-//! category/bar editor, and the evaluation history. Served like the other
-//! plugin pages: public HTML shell on `GET /plugin-api/v1/ui-gauge`, authed
-//! JSON under `/api/plugin-ui/ui-gauge/*`, reached through the parent
-//! `plugin-ui-fetch` postMessage bridge. Images are downscaled client-side
-//! (canvas → JPEG) so each stays under the 256 KB document-store cap.
+//! The UI Gauge page: generate-a-baseline loop, baseline gallery with 1-10
+//! ranking sliders, the category/bar editor, the living overall baseline
+//! prompt, and the evaluation history. Served like the other plugin pages:
+//! public HTML shell on `GET /plugin-api/v1/ui-gauge`, authed JSON under
+//! `/api/plugin-ui/ui-gauge/*`, reached through the parent `plugin-ui-fetch`
+//! postMessage bridge. Uploaded images are downscaled client-side; generated
+//! baselines are agent-submitted HTML rendered in a script-less sandboxed
+//! frame.
 
 use serde_json::{Value, json};
 
-use crate::gauge::{self, BASELINE_IMAGES_COLLECTION, BASELINES_COLLECTION, Baseline, Category};
+use crate::gauge::{
+    self, BASELINE_HTML_COLLECTION, BASELINE_IMAGES_COLLECTION, BASELINES_COLLECTION, Baseline,
+    Category,
+};
+use crate::host::{HostFn, call_host};
 
 pub const PAGE_PATH: &str = "/plugin-api/v1/ui-gauge";
 const API_PREFIX: &str = "/api/plugin-ui/ui-gauge";
@@ -59,12 +65,15 @@ pub fn serve_authed(payload: Value) -> Result<Value, String> {
 
     let out = match (method.as_str(), segs.as_slice()) {
         ("GET", ["state"]) => state_route(),
+        ("GET", ["pickers"]) => pickers_route(),
         ("POST", ["categories"]) => categories_route(&body),
+        ("POST", ["generate"]) => generate_route(&body),
         ("POST", ["baselines"]) => create_baseline_route(&body),
         ("POST", ["baselines", id]) => update_baseline_route(id, &body),
         ("POST", ["baselines", id, "delete"]) => {
             gauge::store_delete(BASELINES_COLLECTION, id);
             gauge::store_delete(BASELINE_IMAGES_COLLECTION, id);
+            gauge::store_delete(BASELINE_HTML_COLLECTION, id);
             Ok(json_response(200, json!({ "ok": true })))
         }
         ("GET", ["baselines", id, "image"]) => {
@@ -73,9 +82,32 @@ pub fn serve_authed(payload: Value) -> Result<Value, String> {
                 None => Ok(json_response(404, json!({ "error": "no image" }))),
             }
         }
+        ("GET", ["baselines", id, "html"]) => {
+            match gauge::store_get(BASELINE_HTML_COLLECTION, id)? {
+                Some(html) => Ok(json_response(200, html)),
+                None => Ok(json_response(404, json!({ "error": "no html" }))),
+            }
+        }
         _ => Ok(json_response(404, json!({ "error": "no such route" }))),
     };
     Ok(out.unwrap_or_else(|e| json_response(400, json!({ "error": e }))))
+}
+
+/// Dropdown data for the generation controls; failures degrade to empty
+/// lists so one missing grant never blanks the page.
+fn pickers_route() -> Result<Value, String> {
+    let folders = call_host(HostFn::ListFolders, &json!({}))
+        .ok()
+        .and_then(|v| v.get("folders").cloned())
+        .unwrap_or(json!([]));
+    let models = call_host(HostFn::ListModels, &json!({}))
+        .ok()
+        .and_then(|v| v.get("models").cloned())
+        .unwrap_or(json!([]));
+    Ok(json_response(
+        200,
+        json!({ "folders": folders, "models": models }),
+    ))
 }
 
 fn state_route() -> Result<Value, String> {
@@ -92,14 +124,27 @@ fn state_route() -> Result<Value, String> {
             })
         })
         .collect();
+    let overall = gauge::overall_prompt(&baselines);
+    let baseline_views: Vec<Value> = baselines
+        .iter()
+        .map(|b| {
+            let mut v = serde_json::to_value(b).unwrap_or(Value::Null);
+            if let Some(map) = v.as_object_mut() {
+                map.insert("avg".into(), json!(b.avg_score()));
+            }
+            v
+        })
+        .collect();
     let mut evals = gauge::evaluations(None);
     evals.truncate(50);
     Ok(json_response(
         200,
         json!({
             "categories": categories,
-            "baselines": baselines,
+            "baselines": baseline_views,
             "evaluations": evals,
+            "overall_prompt": overall,
+            "generation": gauge::generation_state(),
         }),
     ))
 }
@@ -128,6 +173,82 @@ fn categories_route(body: &Value) -> Result<Value, String> {
     }
     gauge::save_categories(&cats)?;
     Ok(json_response(200, json!({ "ok": true })))
+}
+
+/// The button: spawn a temp generation session in the chosen folder with the
+/// chosen model, hand it the iteration prompt, and record the pending
+/// generation. The session submits back via `ui_gauge_submit_baseline`.
+fn generate_route(body: &Value) -> Result<Value, String> {
+    let generation = gauge::generation_state();
+    if generation.get("status").and_then(|s| s.as_str()) == Some("running") {
+        return Err(
+            "a generation is already running — wait for it to submit (or for its session \
+             to end) before starting another"
+                .into(),
+        );
+    }
+    let folder_id = body
+        .get("folder_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("'folder_id' is required")?;
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("'model' is required — pick the model that generates the baseline")?;
+
+    // create_session's authed path takes a folder *path*; resolve the picked id.
+    let folders = call_host(HostFn::ListFolders, &json!({}))?;
+    let folder_path = folders
+        .get("folders")
+        .and_then(|v| v.as_array())
+        .and_then(|fs| {
+            fs.iter()
+                .find(|f| f.get("id").and_then(|i| i.as_str()) == Some(folder_id))
+        })
+        .and_then(|f| f.get("path").and_then(|p| p.as_str()))
+        .ok_or_else(|| format!("folder not found: {folder_id}"))?
+        .to_string();
+
+    let baselines = gauge::baselines();
+    let iteration = baselines.iter().filter(|b| b.kind == "generated").count() + 1;
+    let created = call_host(
+        HostFn::CreateSession,
+        &json!({
+            "name": format!("UI Gauge baseline #{iteration}"),
+            "model": model,
+            "is_temp": true,
+            "folder_path": folder_path,
+            "system_prompt": "You generate one baseline UI iteration for the ui-gauge plugin \
+        and submit it via the ui_gauge_submit_baseline MCP tool. Follow the task prompt exactly; \
+        do not ask the user questions.",
+        }),
+    )?;
+    let session_id = created
+        .get("session")
+        .and_then(|s| s.get("id"))
+        .and_then(|v| v.as_str())
+        .ok_or("create_session returned no session id")?
+        .to_string();
+
+    call_host(
+        HostFn::DispatchCapture,
+        &json!({
+            "session_id": session_id,
+            "prompt": gauge::build_generation_prompt(&baselines),
+        }),
+    )?;
+    gauge::set_generation_state(json!({
+        "status": "running",
+        "session_id": session_id,
+        "model": model,
+        "started_at": gauge::clock(),
+    }));
+    Ok(json_response(
+        200,
+        json!({ "ok": true, "session_id": session_id }),
+    ))
 }
 
 fn parse_scores(v: Option<&Value>) -> std::collections::BTreeMap<String, u8> {
@@ -181,6 +302,8 @@ fn create_baseline_route(body: &Value) -> Result<Value, String> {
         scores: parse_scores(body.get("scores")),
         mime_type: mime_type.clone(),
         created_at: gauge::clock(),
+        kind: "image".into(),
+        change_prompt: String::new(),
     };
     gauge::store_put(
         BASELINES_COLLECTION,
@@ -195,6 +318,8 @@ fn create_baseline_route(body: &Value) -> Result<Value, String> {
     Ok(json_response(200, json!({ "ok": true, "id": id })))
 }
 
+/// Rating writes: the overall prompt recomputes on every read, so saving new
+/// scores here is all "keeping it up to date" requires.
 fn update_baseline_route(id: &str, body: &Value) -> Result<Value, String> {
     let mut b: Baseline = gauge::store_get(BASELINES_COLLECTION, id)?
         .and_then(|v| serde_json::from_value(v).ok())
@@ -228,11 +353,11 @@ const PAGE_HTML: &str = r##"<!doctype html>
   :root {
     color-scheme: light dark;
     --bg: #f5f6f8; --card: #ffffff; --text: #1c1e21; --muted: #667085;
-    --line: #e4e7ec; --accent: #4f6bed; --ok: #12805c; --bad: #b42318;
+    --line: #e4e7ec; --accent: #4f6bed; --ok: #12805c; --bad: #b42318; --warn: #b54708;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #101418; --card: #1a2027; --text: #e6e9ee; --muted: #98a2b3;
-            --line: #2c3540; --accent: #7c93f5; --ok: #3ccb9a; --bad: #f97066; }
+            --line: #2c3540; --accent: #7c93f5; --ok: #3ccb9a; --bad: #f97066; --warn: #f7b26a; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
@@ -245,7 +370,8 @@ const PAGE_HTML: &str = r##"<!doctype html>
            background: var(--card); color: var(--text); cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button.danger { color: var(--bad); }
-  input[type=text], textarea { width: 100%; padding: 6px 8px; border: 1px solid var(--line);
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=text], textarea, select { width: 100%; padding: 6px 8px; border: 1px solid var(--line);
     border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
   input[type=number] { width: 64px; padding: 4px 6px; border: 1px solid var(--line);
     border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
@@ -254,8 +380,10 @@ const PAGE_HTML: &str = r##"<!doctype html>
   th { color: var(--muted); font-weight: 500; }
   .muted { color: var(--muted); font-size: 12px; }
   .error-banner { color: var(--bad); margin: 8px 0; }
-  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
-  .baseline img { width: 100%; border-radius: 8px; border: 1px solid var(--line); }
+  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+  .baseline img, .baseline iframe { width: 100%; height: 210px; border-radius: 8px;
+    border: 1px solid var(--line); background: #fff; object-fit: cover; }
+  .baseline iframe { pointer-events: none; }
   .slider-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
   .slider-row label { flex: 1; font-size: 12px; color: var(--muted); }
   .slider-row input[type=range] { flex: 2; }
@@ -263,11 +391,39 @@ const PAGE_HTML: &str = r##"<!doctype html>
   .verdict-pass { color: var(--ok); font-weight: 600; }
   .verdict-subpar { color: var(--bad); font-weight: 600; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .chip { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px;
+          border: 1px solid var(--line); color: var(--muted); }
+  .chip.ok { color: var(--ok); border-color: var(--ok); }
+  .chip.warn { color: var(--warn); border-color: var(--warn); }
+  pre.prompt { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px; font-size: 12px; max-height: 280px; overflow: auto; }
+  .change { font-size: 12px; border-left: 3px solid var(--accent); padding: 4px 8px;
+    margin: 6px 0; color: var(--muted); }
 </style>
 </head>
 <body>
 <h1>UI Gauge</h1>
 <div id="banner" class="error-banner" style="display:none"></div>
+
+<div class="card">
+  <h2>Generate a baseline</h2>
+  <div class="muted">One button press spawns a temp agent session that designs the next baseline UI —
+  it applies every directive you have already validated, changes one aspect, and explains the change.
+  Rate the result below: 7+ average folds the change into the overall prompt; 4− marks it as one to avoid.</div>
+  <div class="row" style="margin-top:8px">
+    <select id="g-folder" style="flex:1" data-testid="gauge-gen-folder"></select>
+    <select id="g-model" style="flex:1" data-testid="gauge-gen-model"></select>
+    <button class="primary" id="g-btn" data-testid="gauge-generate">Generate baseline</button>
+  </div>
+  <div id="g-status" class="muted" style="margin-top:6px" data-testid="gauge-gen-status"></div>
+</div>
+
+<div class="card">
+  <h2>Overall baseline prompt</h2>
+  <div class="muted">Your validated style directives — rebuilt automatically from every generated
+  baseline you rated 7+/10 (re-rating updates it instantly). Agents get it from ui_gauge_rubric.</div>
+  <pre class="prompt" id="overall" data-testid="gauge-overall"></pre>
+</div>
 
 <div class="card">
   <h2>Categories &amp; bars</h2>
@@ -280,7 +436,7 @@ const PAGE_HTML: &str = r##"<!doctype html>
 </div>
 
 <div class="card">
-  <h2>Add a baseline</h2>
+  <h2>Add a screenshot baseline</h2>
   <div class="muted">Upload a reference screenshot and rank it 1-10 per category. These rankings calibrate the agent's scoring to YOUR scale. Images are downscaled to fit storage.</div>
   <div class="row" style="margin:8px 0">
     <input type="file" id="b-file" accept="image/*" data-testid="gauge-file">
@@ -332,13 +488,39 @@ const BASE = "/api/plugin-ui/ui-gauge";
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
   (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-let STATE = { categories: [], baselines: [], evaluations: [] };
+let STATE = { categories: [], baselines: [], evaluations: [], overall_prompt: "", generation: { status: "idle" } };
+let PICKERS = { folders: [], models: [] };
 const imgCache = {};
+const htmlCache = {};
 
 function banner(msg) {
   const el = document.getElementById("banner");
   el.style.display = msg ? "" : "none";
   el.textContent = msg || "";
+}
+
+function renderGenerate() {
+  const f = document.getElementById("g-folder");
+  const m = document.getElementById("g-model");
+  if (f.options.length <= 1 && PICKERS.folders.length) {
+    f.innerHTML = '<option value="">— folder for the generation session —</option>' +
+      PICKERS.folders.map((x) => '<option value="' + esc(x.id) + '">' + esc(x.name) + '</option>').join("");
+  }
+  if (m.options.length <= 1 && PICKERS.models.length) {
+    m.innerHTML = '<option value="">— model —</option>' +
+      PICKERS.models.map((x) => { const id = x.id || x.model_id || ""; return '<option value="' + esc(id) + '">' + esc(x.display_name || id) + '</option>'; }).join("");
+  }
+  const g = STATE.generation || {};
+  const st = document.getElementById("g-status");
+  document.getElementById("g-btn").disabled = g.status === "running";
+  if (g.status === "running") st.textContent = "Generating… the agent session is designing the next baseline (this page updates itself).";
+  else if (g.status === "done") st.textContent = "Last generation submitted a baseline — rate it below.";
+  else if (g.status === "ended") st.textContent = "The last generation session ended WITHOUT submitting a baseline — try again (a stronger model helps).";
+  else st.textContent = "";
+}
+
+function renderOverall() {
+  document.getElementById("overall").textContent = STATE.overall_prompt || "";
 }
 
 function renderCats() {
@@ -371,25 +553,47 @@ async function loadImage(id) {
   } catch (_) { imgCache[id] = ""; }
   return imgCache[id];
 }
+async function loadHtml(id) {
+  if (htmlCache[id]) return htmlCache[id];
+  try {
+    const r = await api("GET", BASE + "/baselines/" + id + "/html");
+    htmlCache[id] = r.html || "";
+  } catch (_) { htmlCache[id] = ""; }
+  return htmlCache[id];
+}
 function renderGallery() {
   const g = document.getElementById("gallery");
   if (!STATE.baselines.length) {
-    g.innerHTML = '<div class="muted">No baselines yet — add reference screenshots above and rank them.</div>';
+    g.innerHTML = '<div class="muted">No baselines yet — press Generate baseline, or upload reference screenshots.</div>';
     return;
   }
-  g.innerHTML = STATE.baselines.map((b) =>
-    '<div class="baseline card" data-testid="gauge-baseline" data-base="' + esc(b.id) + '">' +
-    '<img data-img="' + esc(b.id) + '" alt="' + esc(b.name) + '">' +
-    '<b>' + esc(b.name) + '</b>' +
-    (b.notes ? '<div class="muted">' + esc(b.notes) + '</div>' : "") +
-    sliderRows("score-" + b.id, b.scores) +
-    '<div class="row" style="margin-top:6px">' +
-    '<button class="primary" data-base-save="' + esc(b.id) + '">Save rankings</button>' +
-    '<button class="danger" data-base-del="' + esc(b.id) + '">Delete</button>' +
-    '</div></div>').join("");
+  g.innerHTML = STATE.baselines.slice().reverse().map((b) => {
+    const rated = b.avg != null;
+    const chip = !rated ? '<span class="chip warn">unrated</span>' :
+      '<span class="chip' + (b.avg >= 7 ? ' ok' : '') + '">avg ' + b.avg.toFixed(1) + (b.avg >= 7 && b.kind === 'generated' ? ' → in overall prompt' : '') + '</span>';
+    const preview = b.kind === 'generated'
+      ? '<iframe sandbox="" data-html="' + esc(b.id) + '" title="' + esc(b.name) + '"></iframe>'
+      : '<img data-img="' + esc(b.id) + '" alt="' + esc(b.name) + '">';
+    return '<div class="baseline card" data-testid="gauge-baseline" data-base="' + esc(b.id) + '">' +
+      preview +
+      '<div class="row"><b>' + esc(b.name) + '</b>' + chip + '</div>' +
+      (b.kind === 'generated' && b.change_prompt ?
+        '<div class="change" data-testid="gauge-change">' + esc(b.change_prompt) + '</div>' : "") +
+      (b.notes ? '<div class="muted">' + esc(b.notes) + '</div>' : "") +
+      sliderRows("score-" + b.id, b.scores) +
+      '<div class="row" style="margin-top:6px">' +
+      '<button class="primary" data-base-save="' + esc(b.id) + '">Save rankings</button>' +
+      '<button class="danger" data-base-del="' + esc(b.id) + '">Delete</button>' +
+      '</div></div>';
+  }).join("");
   STATE.baselines.forEach(async (b) => {
-    const el = g.querySelector('img[data-img="' + b.id + '"]');
-    if (el) el.src = await loadImage(b.id);
+    if (b.kind === 'generated') {
+      const el = g.querySelector('iframe[data-html="' + b.id + '"]');
+      if (el) el.srcdoc = await loadHtml(b.id);
+    } else {
+      const el = g.querySelector('img[data-img="' + b.id + '"]');
+      if (el) el.src = await loadImage(b.id);
+    }
   });
 }
 function renderEvals() {
@@ -412,7 +616,16 @@ function renderEvals() {
         '</tr>';
     }).join("");
 }
-function render() { renderCats(); renderNewBaselineSliders(); renderGallery(); renderEvals(); }
+function render() { renderGenerate(); renderOverall(); renderCats(); renderNewBaselineSliders(); renderGallery(); renderEvals(); }
+
+document.getElementById("g-btn").onclick = async () => {
+  const folder_id = document.getElementById("g-folder").value;
+  const model = document.getElementById("g-model").value;
+  if (!folder_id) { banner("pick a folder for the generation session"); return; }
+  if (!model) { banner("pick a model"); return; }
+  try { banner(""); await api("POST", BASE + "/generate", { folder_id, model }); await refresh(); }
+  catch (e) { banner(e.message); }
+};
 
 document.getElementById("cats").addEventListener("click", (ev) => {
   const del = ev.target.closest("button[data-cat-del]");
@@ -494,9 +707,9 @@ document.getElementById("gallery").addEventListener("click", async (ev) => {
       await refresh();
     } else if (del) {
       const id = del.dataset.baseDel;
-      if (!confirm("Delete this baseline?")) return;
+      if (!confirm("Delete this baseline? A deleted high-rated baseline also leaves the overall prompt.")) return;
       await api("POST", BASE + "/baselines/" + id + "/delete");
-      delete imgCache[id];
+      delete imgCache[id]; delete htmlCache[id];
       await refresh();
     }
   } catch (e) { banner(e.message); }
@@ -506,14 +719,12 @@ async function refresh() {
   try { STATE = await api("GET", BASE + "/state"); render(); }
   catch (e) { banner(e.message); }
 }
-refresh();
-setInterval(async () => {
-  try {
-    const s = await api("GET", BASE + "/state");
-    STATE.evaluations = s.evaluations;
-    renderEvals();
-  } catch (_) {}
-}, 10000);
+async function boot() {
+  try { PICKERS = await api("GET", BASE + "/pickers"); } catch (_) {}
+  await refresh();
+  setInterval(refresh, 5000);
+}
+boot();
 </script>
 </body>
 </html>
@@ -524,10 +735,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn page_html_has_bridge_and_testids() {
+    fn page_html_has_bridge_generation_and_testids() {
         assert!(PAGE_HTML.contains("plugin-ui-fetch"));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-baseline\""));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-eval\""));
+        assert!(PAGE_HTML.contains("data-testid=\"gauge-generate\""));
+        assert!(PAGE_HTML.contains("data-testid=\"gauge-overall\""));
+        assert!(PAGE_HTML.contains("data-testid=\"gauge-gen-status\""));
+        // Generated previews must never execute scripts.
+        assert!(PAGE_HTML.contains("iframe sandbox=\"\""));
         assert!(PAGE_HTML.contains("/api/plugin-ui/ui-gauge"));
     }
 
