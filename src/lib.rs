@@ -117,9 +117,16 @@ fn handle_invoke(payload: serde_json::Value) -> String {
     let result: Result<serde_json::Value, String> = match tool.as_str() {
         "ui_gauge_rubric" => tools::rubric_tool(args),
         "ui_gauge_baseline_image" => tools::baseline_image_tool(args),
-        "ui_gauge_score" => tools::score_tool(args),
+        // The two writing tools hold the cross-instance store lease so their
+        // read→modify→write stays atomic when calls run on several wasm
+        // instances (manifest `concurrency` > 1).
+        "ui_gauge_score" => gauge::try_with_store_lock(|| tools::score_tool(args))
+            .and_then(|r| r.ok_or_else(|| gauge::BUSY_MSG.to_string())),
         "ui_gauge_history" => tools::history_tool(args),
-        "ui_gauge_submit_baseline" => tools::submit_baseline_tool(args),
+        "ui_gauge_submit_baseline" => {
+            gauge::try_with_store_lock(|| tools::submit_baseline_tool(args))
+                .and_then(|r| r.ok_or_else(|| gauge::BUSY_MSG.to_string()))
+        }
         other => return cancel(&format!("ui-gauge does not provide tool '{other}'")),
     };
 

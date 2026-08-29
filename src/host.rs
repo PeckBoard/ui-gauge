@@ -7,6 +7,9 @@ pub enum HostFn {
     StoreGet,
     StoreList,
     StoreDelete,
+    /// Atomic put-if-absent — the cross-instance lease behind
+    /// `gauge::try_with_store_lock` (0.2.2, needs peckboard ≥ 0.0.189).
+    StorePutIfAbsent,
     CallerScope,
     CreateCard,
     // Baseline generation (0.2.0): spawn + drive a temp generation session,
@@ -28,6 +31,7 @@ mod imp {
         fn peckboard_store_get(input: String) -> String;
         fn peckboard_store_list(input: String) -> String;
         fn peckboard_store_delete(input: String) -> String;
+        fn peckboard_store_put_if_absent(input: String) -> String;
         fn peckboard_caller_scope(input: String) -> String;
         fn peckboard_create_card(input: String) -> String;
         fn peckboard_create_session(input: String) -> String;
@@ -47,6 +51,7 @@ mod imp {
                 HostFn::StoreGet => peckboard_store_get(s),
                 HostFn::StoreList => peckboard_store_list(s),
                 HostFn::StoreDelete => peckboard_store_delete(s),
+                HostFn::StorePutIfAbsent => peckboard_store_put_if_absent(s),
                 HostFn::CallerScope => peckboard_caller_scope(s),
                 HostFn::CreateCard => peckboard_create_card(s),
                 HostFn::CreateSession => peckboard_create_session(s),

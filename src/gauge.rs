@@ -135,6 +135,49 @@ pub fn store_delete(collection: &str, key: &str) {
     );
 }
 
+/// One global mutex around every store read→modify→write. With manifest
+/// `concurrency` > 1 the host runs this plugin's calls on several wasm
+/// instances at once; guest memory can't lock across them, so mutual
+/// exclusion rides on the host store's atomic put-if-absent (peckboard ≥
+/// 0.0.189). `Ok(None)` = contended — surface "busy" to the caller. `f`
+/// must LOAD what it mutates inside the closure.
+#[cfg(target_arch = "wasm32")]
+pub fn try_with_store_lock<T>(
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let acquired = call_host(
+        HostFn::StorePutIfAbsent,
+        &json!({
+            "collection": "locks",
+            "key": "store",
+            "data": { "at": clock() },
+            // Above the 30s call budget generate/judge calls can use, so a
+            // live holder is never stolen; a trapped one leaks ≤ 60s.
+            "ttl_secs": 60,
+        }),
+    )?
+    .get("acquired")
+    .and_then(|v| v.as_bool())
+    .unwrap_or(false);
+    if !acquired {
+        return Ok(None);
+    }
+    let out = f();
+    store_delete("locks", "store");
+    out.map(Some)
+}
+
+/// Host builds (unit tests) are single-threaded pure logic — no lease.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn try_with_store_lock<T>(
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    f().map(Some)
+}
+
+/// The user-facing form of lease contention.
+pub const BUSY_MSG: &str = "another ui-gauge update is in flight — try again in a moment";
+
 /// Host-supplied clock, stored on `timer.tick` (wasm has no time source).
 pub fn set_clock(now: &str) {
     let _ = store_put(ENGINE_COLLECTION, "clock", json!({ "now": now }));

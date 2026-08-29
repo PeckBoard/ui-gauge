@@ -63,13 +63,20 @@ pub fn serve_authed(payload: Value) -> Result<Value, String> {
     let rest = path.strip_prefix(API_PREFIX).unwrap_or("");
     let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
 
+    // Mutating routes hold the cross-instance store lease (manifest
+    // `concurrency` > 1 runs calls on several wasm instances); the routes
+    // load whatever they modify inside themselves, so wrapping here keeps
+    // every read→modify→write atomic. Contended → a "busy" banner.
+    let locked = |f: &dyn Fn() -> Result<Value, String>| -> Result<Value, String> {
+        gauge::try_with_store_lock(f)?.ok_or_else(|| gauge::BUSY_MSG.to_string())
+    };
     let out = match (method.as_str(), segs.as_slice()) {
         ("GET", ["state"]) => state_route(),
         ("GET", ["pickers"]) => pickers_route(),
         ("POST", ["categories"]) => categories_route(&body),
-        ("POST", ["generate"]) => generate_route(&body),
-        ("POST", ["baselines"]) => create_baseline_route(&body),
-        ("POST", ["baselines", id]) => update_baseline_route(id, &body),
+        ("POST", ["generate"]) => locked(&|| generate_route(&body)),
+        ("POST", ["baselines"]) => locked(&|| create_baseline_route(&body)),
+        ("POST", ["baselines", id]) => locked(&|| update_baseline_route(id, &body)),
         ("POST", ["baselines", id, "delete"]) => {
             gauge::store_delete(BASELINES_COLLECTION, id);
             gauge::store_delete(BASELINE_IMAGES_COLLECTION, id);
