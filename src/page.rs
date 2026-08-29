@@ -719,10 +719,21 @@ async function refresh() {
   try { STATE = await api("GET", BASE + "/state"); render(); }
   catch (e) { banner(e.message); }
 }
+async function loadPickers() {
+  PICKERS = await api("GET", BASE + "/pickers");
+}
 async function boot() {
-  try { PICKERS = await api("GET", BASE + "/pickers"); } catch (_) {}
+  try { await loadPickers(); }
+  catch (e) { banner("Failed to load folder/model lists: " + e.message); }
   await refresh();
   setInterval(refresh, 5000);
+  // Retry while empty so a slow or failed first fetch never leaves the
+  // generation dropdowns permanently blank.
+  setInterval(async () => {
+    if (!PICKERS.folders.length || !PICKERS.models.length) {
+      try { await loadPickers(); renderGenerate(); } catch (_) {}
+    }
+  }, 5000);
 }
 boot();
 </script>
