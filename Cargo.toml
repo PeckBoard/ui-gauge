@@ -1,0 +1,23 @@
+[package]
+name = "peckboard-ui-gauge-plugin"
+version = "0.1.0"
+edition = "2024"
+description = "Gauge UI design quality against user-ranked baselines: rank reference screenshots 1-10 per category, score worker output on the same calibrated scale, and turn subpar results into follow-up cards."
+repository = "https://github.com/PeckBoard/ui-gauge"
+license = "MIT"
+publish = false
+
+[lib]
+# Extism loads plugins as WASM cdylibs. The compiled artifact is
+# `target/wasm32-unknown-unknown/release/peckboard_ui_gauge_plugin.wasm`.
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
