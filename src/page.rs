@@ -470,7 +470,6 @@ let seq = 1;
 const pending = {};
 window.addEventListener("message", (e) => {
   const m = e.data;
-  if (m && m.type === "plugin-ui-event") { onHostEvent(m); return; }
   if (!m || m.type !== "plugin-ui-fetch-result") return;
   const cb = pending[m.requestId];
   if (!cb) return;
@@ -727,20 +726,56 @@ async function refresh() {
   try { STATE = await api("GET", BASE + "/state"); render(); }
   catch (e) { banner(e.message); }
 }
-// The host forwards core's plugin-data WS frames into this iframe as
-// { type: "plugin-ui-event", event: "plugin-data", collection }. Refresh on
-// change (debounced — a run writes several rows back to back); the interval
-// in boot() is only a slow fallback. "locks" is the cross-instance lease
+// Live updates: the page holds its own WebSocket to core. The parent frame
+// mints a one-time, plugin-scoped ticket over its authed fetch (the JWT
+// never enters this sandbox) and hands it over via postMessage; core's
+// /ws/plugin-ui then streams this plugin's data-change notifications
+// (identifiers only). No polling: a dropped socket reconnects with backoff
+// and refetches once to cover the gap. "locks" is the cross-instance lease
 // collection: written per run, never rendered, so it must not trigger
 // refreshes.
 let refreshTimer = null;
-function onHostEvent(m) {
-  if (m.event !== "plugin-data" || m.collection === "locks") return;
+function scheduleRefresh() {
   if (refreshTimer) return;
   refreshTimer = setTimeout(() => {
     refreshTimer = null;
     refresh();
   }, 300);
+}
+function requestTicket() {
+  return new Promise((resolve) => {
+    const onMsg = (e) => {
+      const m = e.data;
+      if (!m || m.type !== "plugin-ui-ws-ticket-result") return;
+      window.removeEventListener("message", onMsg);
+      resolve(m.ticket || null);
+    };
+    window.addEventListener("message", onMsg);
+    parent.postMessage({ type: "plugin-ui-ws-ticket" }, "*");
+    setTimeout(() => { window.removeEventListener("message", onMsg); resolve(null); }, 10000);
+  });
+}
+let wsBackoff = 1000;
+async function connectEvents() {
+  const ticket = await requestTicket();
+  if (!ticket) {
+    setTimeout(connectEvents, wsBackoff);
+    wsBackoff = Math.min(wsBackoff * 2, 30000);
+    return;
+  }
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(proto + "//" + location.host + "/ws/plugin-ui?ticket=" + encodeURIComponent(ticket));
+  ws.onopen = () => { wsBackoff = 1000; scheduleRefresh(); };
+  ws.onmessage = (ev) => {
+    let m = null;
+    try { m = JSON.parse(ev.data); } catch (_) {}
+    if (m && m.collection === "locks") return;
+    scheduleRefresh();
+  };
+  ws.onclose = () => {
+    setTimeout(connectEvents, wsBackoff);
+    wsBackoff = Math.min(wsBackoff * 2, 30000);
+  };
 }
 async function loadPickers() {
   PICKERS = await api("GET", BASE + "/pickers");
@@ -749,9 +784,7 @@ async function boot() {
   try { await loadPickers(); }
   catch (e) { banner("Failed to load folder/model lists: " + e.message); }
   await refresh();
-  // Slow fallback only — plugin-data events pushed by the host drive
-  // refreshes the moment a run writes.
-  setInterval(refresh, 60000);
+  connectEvents();
   // Retry while empty so a slow or failed first fetch never leaves the
   // generation dropdowns permanently blank.
   setInterval(async () => {
@@ -773,10 +806,12 @@ mod tests {
     #[test]
     fn page_html_has_bridge_generation_and_testids() {
         assert!(PAGE_HTML.contains("plugin-ui-fetch"));
-        // Host-pushed refresh: the page must handle the forwarded
-        // plugin-data event and keep only a slow fallback poll.
-        assert!(PAGE_HTML.contains("plugin-ui-event"));
-        assert!(PAGE_HTML.contains("setInterval(refresh, 60000)"));
+        // Live updates ride the page's own ticket-authed WebSocket — the
+        // page must mint tickets via the bridge, connect to /ws/plugin-ui,
+        // and never poll.
+        assert!(PAGE_HTML.contains("plugin-ui-ws-ticket"));
+        assert!(PAGE_HTML.contains("/ws/plugin-ui?ticket="));
+        assert!(!PAGE_HTML.contains("setInterval(refresh"));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-baseline\""));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-eval\""));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-generate\""));
