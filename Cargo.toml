@@ -1,6 +1,6 @@
 [package]
 name = "peckboard-ui-gauge-plugin"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "Gauge UI design quality against user-ranked baselines: generate baseline UIs with one button, rate each 1-10 per category, and let high-rated changes build a living overall baseline prompt; agents score worker output on the same calibrated scale and subpar results become follow-up cards."
 repository = "https://github.com/PeckBoard/ui-gauge"

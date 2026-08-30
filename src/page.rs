@@ -470,6 +470,7 @@ let seq = 1;
 const pending = {};
 window.addEventListener("message", (e) => {
   const m = e.data;
+  if (m && m.type === "plugin-ui-event") { onHostEvent(m); return; }
   if (!m || m.type !== "plugin-ui-fetch-result") return;
   const cb = pending[m.requestId];
   if (!cb) return;
@@ -726,6 +727,21 @@ async function refresh() {
   try { STATE = await api("GET", BASE + "/state"); render(); }
   catch (e) { banner(e.message); }
 }
+// The host forwards core's plugin-data WS frames into this iframe as
+// { type: "plugin-ui-event", event: "plugin-data", collection }. Refresh on
+// change (debounced — a run writes several rows back to back); the interval
+// in boot() is only a slow fallback. "locks" is the cross-instance lease
+// collection: written per run, never rendered, so it must not trigger
+// refreshes.
+let refreshTimer = null;
+function onHostEvent(m) {
+  if (m.event !== "plugin-data" || m.collection === "locks") return;
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    refresh();
+  }, 300);
+}
 async function loadPickers() {
   PICKERS = await api("GET", BASE + "/pickers");
 }
@@ -733,7 +749,9 @@ async function boot() {
   try { await loadPickers(); }
   catch (e) { banner("Failed to load folder/model lists: " + e.message); }
   await refresh();
-  setInterval(refresh, 5000);
+  // Slow fallback only — plugin-data events pushed by the host drive
+  // refreshes the moment a run writes.
+  setInterval(refresh, 60000);
   // Retry while empty so a slow or failed first fetch never leaves the
   // generation dropdowns permanently blank.
   setInterval(async () => {
@@ -755,6 +773,10 @@ mod tests {
     #[test]
     fn page_html_has_bridge_generation_and_testids() {
         assert!(PAGE_HTML.contains("plugin-ui-fetch"));
+        // Host-pushed refresh: the page must handle the forwarded
+        // plugin-data event and keep only a slow fallback poll.
+        assert!(PAGE_HTML.contains("plugin-ui-event"));
+        assert!(PAGE_HTML.contains("setInterval(refresh, 60000)"));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-baseline\""));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-eval\""));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-generate\""));
