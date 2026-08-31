@@ -410,6 +410,10 @@ const PAGE_HTML: &str = r##"<!doctype html>
 </head>
 <body>
 <h1>UI Gauge</h1>
+<div class="row" style="margin-bottom:12px">
+  <button id="refresh-btn" data-testid="gauge-refresh">Refresh</button>
+  <span id="stale" class="chip warn" style="display:none" data-testid="gauge-stale">data changed elsewhere — press Refresh when ready</span>
+</div>
 <div id="banner" class="error-banner" style="display:none"></div>
 
 <div class="card">
@@ -520,7 +524,7 @@ function renderGenerate() {
   const g = STATE.generation || {};
   const st = document.getElementById("g-status");
   document.getElementById("g-btn").disabled = g.status === "running";
-  if (g.status === "running") st.textContent = "Generating… the agent session is designing the next baseline (this page updates itself).";
+  if (g.status === "running") st.textContent = "Generating… the agent session is designing the next baseline (press Refresh to check on it).";
   else if (g.status === "done") st.textContent = "Last generation submitted a baseline — rate it below.";
   else if (g.status === "ended") st.textContent = "The last generation session ended WITHOUT submitting a baseline — try again (a stronger model helps).";
   else st.textContent = "";
@@ -723,24 +727,22 @@ document.getElementById("gallery").addEventListener("click", async (ev) => {
 });
 
 async function refresh() {
-  try { STATE = await api("GET", BASE + "/state"); render(); }
+  try {
+    STATE = await api("GET", BASE + "/state");
+    document.getElementById("stale").style.display = "none";
+    render();
+  }
   catch (e) { banner(e.message); }
 }
-// Live updates: the page holds its own WebSocket to core. The parent frame
-// mints a one-time, plugin-scoped ticket over its authed fetch (the JWT
-// never enters this sandbox) and hands it over via postMessage; core's
-// /ws/plugin-ui then streams this plugin's data-change notifications
-// (identifiers only). No polling: a dropped socket reconnects with backoff
-// and refetches once to cover the gap. "locks" is the cross-instance lease
-// collection: written per run, never rendered, so it must not trigger
-// refreshes.
-let refreshTimer = null;
-function scheduleRefresh() {
-  if (refreshTimer) return;
-  refreshTimer = setTimeout(() => {
-    refreshTimer = null;
-    refresh();
-  }, 300);
+document.getElementById("refresh-btn").onclick = refresh;
+// NO automatic refresh, ever: a re-render wipes in-progress slider
+// ratings, so the page must never reload state except on explicit user
+// action. The WebSocket below (ticket-authed via the parent frame; the
+// JWT never enters this sandbox) only lights the "data changed" chip —
+// the user presses Refresh when ready. "locks" is the cross-instance
+// lease collection: written per run, never rendered, so it stays ignored.
+function markStale() {
+  document.getElementById("stale").style.display = "";
 }
 function requestTicket() {
   return new Promise((resolve) => {
@@ -756,6 +758,7 @@ function requestTicket() {
   });
 }
 let wsBackoff = 1000;
+let wsHadConnection = false;
 async function connectEvents() {
   const ticket = await requestTicket();
   if (!ticket) {
@@ -765,12 +768,17 @@ async function connectEvents() {
   }
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(proto + "//" + location.host + "/ws/plugin-ui?ticket=" + encodeURIComponent(ticket));
-  ws.onopen = () => { wsBackoff = 1000; scheduleRefresh(); };
+  ws.onopen = () => {
+    wsBackoff = 1000;
+    // A reconnect may have missed change events — flag, never reload.
+    if (wsHadConnection) markStale();
+    wsHadConnection = true;
+  };
   ws.onmessage = (ev) => {
     let m = null;
     try { m = JSON.parse(ev.data); } catch (_) {}
     if (m && m.collection === "locks") return;
-    scheduleRefresh();
+    markStale();
   };
   ws.onclose = () => {
     setTimeout(connectEvents, wsBackoff);
@@ -786,11 +794,11 @@ async function boot() {
   await refresh();
   connectEvents();
   // Retry while empty so a slow or failed first fetch never leaves the
-  // generation dropdowns permanently blank.
-  setInterval(async () => {
-    if (!PICKERS.folders.length || !PICKERS.models.length) {
-      try { await loadPickers(); renderGenerate(); } catch (_) {}
-    }
+  // generation dropdowns permanently blank. Only rewrites the two
+  // dropdowns (never the rating sliders) and stops once populated.
+  const pickerTimer = setInterval(async () => {
+    if (PICKERS.folders.length && PICKERS.models.length) { clearInterval(pickerTimer); return; }
+    try { await loadPickers(); renderGenerate(); } catch (_) {}
   }, 5000);
 }
 boot();
@@ -806,12 +814,16 @@ mod tests {
     #[test]
     fn page_html_has_bridge_generation_and_testids() {
         assert!(PAGE_HTML.contains("plugin-ui-fetch"));
-        // Live updates ride the page's own ticket-authed WebSocket — the
-        // page must mint tickets via the bridge, connect to /ws/plugin-ui,
-        // and never poll.
+        // Change notifications ride the page's own ticket-authed WebSocket,
+        // but they must NEVER auto-refresh the page — a re-render wipes
+        // in-progress slider ratings. Events only light the stale chip; the
+        // user reloads via the Refresh button.
         assert!(PAGE_HTML.contains("plugin-ui-ws-ticket"));
         assert!(PAGE_HTML.contains("/ws/plugin-ui?ticket="));
         assert!(!PAGE_HTML.contains("setInterval(refresh"));
+        assert!(!PAGE_HTML.contains("scheduleRefresh"));
+        assert!(PAGE_HTML.contains("data-testid=\"gauge-refresh\""));
+        assert!(PAGE_HTML.contains("data-testid=\"gauge-stale\""));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-baseline\""));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-eval\""));
         assert!(PAGE_HTML.contains("data-testid=\"gauge-generate\""));
