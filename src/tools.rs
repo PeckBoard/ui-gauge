@@ -1,9 +1,9 @@
-//! The MCP tools: rubric (calibration), baseline images (anchors), score
-//! (verdict + follow-up cards), and history.
+//! The MCP tools: submit a generated page, read the user's UI preference
+//! prompt, fetch a starred-element reference screenshot, and page history.
 
 use serde_json::{Value, json};
 
-use crate::gauge::{self, BASELINE_IMAGES_COLLECTION};
+use crate::gauge::{self, Feedback, Page, PageElement};
 use crate::host::{HostFn, call_host};
 
 fn require_str(args: &Value, key: &str) -> Result<String, String> {
@@ -14,228 +14,37 @@ fn require_str(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("'{key}' is required"))
 }
 
-/// `ui_gauge_rubric {}` — categories, bars, and the user's baseline rankings
-/// (scores + notes, images by reference) so the calling agent scores on the
-/// USER's calibrated 1-10 scale, not its own.
-pub fn rubric_tool(_args: Value) -> Result<Value, String> {
-    let cats = gauge::categories();
-    let baselines = gauge::baselines();
-    let categories: Vec<Value> = cats
-        .iter()
-        .map(|c| {
-            json!({
-                "key": c.key,
-                "label": c.label,
-                "bar": gauge::bar_for(c, &baselines),
-            })
-        })
-        .collect();
-    let anchors: Vec<Value> = baselines
-        .iter()
-        .map(|b| {
-            json!({
-                "id": b.id,
-                "name": b.name,
-                "notes": b.notes,
-                "user_scores": b.scores,
-                "kind": b.kind,
-                "change_prompt": b.change_prompt,
-            })
-        })
-        .collect();
-    Ok(json!({
-        "categories": categories,
-        "baselines": anchors,
-        "overall_prompt": gauge::overall_prompt(&baselines),
-        "instructions": "Score the target UI 1-10 per category ON THE USER'S SCALE: each \
-    baseline above was ranked by the user — fetch one or two with ui_gauge_baseline_image, \
-    compare the target against them, and calibrate your numbers so a screenshot the user \
-    would rank 6 gets a 6. Then call ui_gauge_score with every category scored. A category \
-    at or above its bar passes; below the bar is subpar and creates follow-up work. When \
-    BUILDING UI (not just judging it), apply every directive in overall_prompt — those are \
-    the styles this user has explicitly validated.",
-    }))
+fn shot_keys() -> std::collections::BTreeSet<String> {
+    gauge::store_list(gauge::SHOTS_COLLECTION)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
 }
 
-/// `ui_gauge_baseline_image { id }` — one baseline's image, for calibration.
-pub fn baseline_image_tool(args: Value) -> Result<Value, String> {
-    let id = require_str(&args, "id")?;
-    let img = gauge::store_get(BASELINE_IMAGES_COLLECTION, &id)?
-        .ok_or_else(|| format!("no baseline image '{id}'"))?;
-    Ok(img)
-}
-
-/// `ui_gauge_score { target, scores, notes? }` — verdict against the bars;
-/// subpar auto-creates one card per gap when the caller has project scope.
-pub fn score_tool(args: Value) -> Result<Value, String> {
-    let target = require_str(&args, "target")?;
-    let notes = args
-        .get("notes")
+/// `ui_gauge_submit_page { html, elements, name, design_notes? }` — the
+/// generation session submits one marked-up page. Stored unreviewed; the
+/// user gives per-element feedback on the UI Gauge page, which feeds the
+/// preference prompt. Completes the page's pending generation when the
+/// caller is that generation's session.
+pub fn submit_page_tool(args: Value) -> Result<Value, String> {
+    let html = require_str(&args, "html")?;
+    let name = require_str(&args, "name")?;
+    let design_notes = args
+        .get("design_notes")
         .and_then(|v| v.as_str())
         .unwrap_or("")
+        .trim()
         .to_string();
-    let raw_scores = args
-        .get("scores")
-        .and_then(|v| v.as_object())
-        .ok_or("'scores' is required: {category_key: 1-10, ...}")?;
-    let mut scores = std::collections::BTreeMap::new();
-    for (k, v) in raw_scores {
-        let n = v
-            .as_u64()
-            .filter(|n| (1..=10).contains(n))
-            .ok_or_else(|| format!("score for '{k}' must be an integer 1-10"))?;
-        scores.insert(k.clone(), n as u8);
-    }
+    let elements: Vec<PageElement> = serde_json::from_value(
+        args.get("elements")
+            .cloned()
+            .ok_or("'elements' is required: [{id, label, kind?}, ...]")?,
+    )
+    .map_err(|e| format!("bad elements: {e}"))?;
+    gauge::validate_submission(&html, &elements)?;
 
-    let cats = gauge::categories();
-    let baselines = gauge::baselines();
-    let gaps = gauge::judge(&scores, &cats, &baselines)?;
-    let verdict = if gaps.is_empty() { "pass" } else { "subpar" };
-
-    // Subpar → follow-up cards in the caller's project (best-effort: a chat
-    // session without project scope still gets the verdict + gap list).
-    let mut cards_created: Vec<Value> = Vec::new();
-    let mut cards_note = Value::Null;
-    if !gaps.is_empty() {
-        let scope = call_host(HostFn::CallerScope, &json!({}))?;
-        match scope.get("project_id").and_then(|v| v.as_str()) {
-            Some(project_id) if !project_id.is_empty() => {
-                for g in &gaps {
-                    let title = format!(
-                        "UI: improve {} on {target} — scored {}, bar {}",
-                        g.label.to_lowercase(),
-                        g.score,
-                        g.bar
-                    );
-                    let description = format!(
-                        "ui-gauge scored \"{target}\" below the user's design bar.\n\n\
-Category: {} ({})\nScore: {} / bar {}\n\nEvaluator notes: {}\n\n\
-Raise this category to at least the bar, then re-run the ui-gauge evaluation \
-(ui_gauge_rubric → score the updated UI → ui_gauge_score).",
-                        g.label,
-                        g.category,
-                        g.score,
-                        g.bar,
-                        if notes.is_empty() { "(none)" } else { &notes }
-                    );
-                    match call_host(
-                        HostFn::CreateCard,
-                        &json!({ "project_id": project_id, "title": title, "description": description }),
-                    ) {
-                        Ok(v) => {
-                            let id = v
-                                .get("card")
-                                .and_then(|c| c.get("id"))
-                                .cloned()
-                                .unwrap_or(Value::Null);
-                            cards_created.push(json!({ "title": title, "card_id": id }));
-                        }
-                        Err(e) => {
-                            cards_note = json!(format!("card creation failed: {e}"));
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {
-                cards_note = json!(
-                    "caller has no project scope — no cards created; create follow-up \
-                     work yourself from the gap list"
-                );
-            }
-        }
-    }
-
-    let ts = gauge::clock();
-    let eval = json!({
-        "id": gauge::new_id("eval"),
-        "ts": ts,
-        "target": target,
-        "scores": scores,
-        "verdict": verdict,
-        "gaps": gaps,
-        "notes": notes,
-        "cards_created": cards_created,
-    });
-    gauge::record_evaluation(eval.clone())?;
-
-    Ok(json!({
-        "verdict": verdict,
-        "gaps": eval["gaps"],
-        "cards_created": cards_created,
-        "cards_note": cards_note,
-        "message": if gaps.is_empty() {
-            "All categories at or above the user's bar.".to_string()
-        } else {
-            format!(
-                "{} categor(ies) below the bar — drive the follow-up work, then re-evaluate.",
-                eval["gaps"].as_array().map(|a| a.len()).unwrap_or(0)
-            )
-        },
-    }))
-}
-
-/// `ui_gauge_history { target? }` — past evaluations, newest first.
-pub fn history_tool(args: Value) -> Result<Value, String> {
-    let target = args
-        .get("target")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty());
-    let mut evals = gauge::evaluations(target);
-    evals.truncate(25);
-    Ok(json!({ "evaluations": evals }))
-}
-
-/// `ui_gauge_submit_baseline { html, change_summary, name? }` — an agent
-/// submits one generated baseline UI. Stored unrated; the user rates it on
-/// the UI Gauge page, and a high rating graduates `change_summary` into the
-/// overall baseline prompt. Completes the page's pending generation when the
-/// caller is that generation's session.
-pub fn submit_baseline_tool(args: Value) -> Result<Value, String> {
-    let html = require_str(&args, "html")?;
-    let change_summary = require_str(&args, "change_summary")?;
-    if html.len() > gauge::HTML_MAX_LEN {
-        return Err(format!(
-            "html too large ({} chars, max {}) — trim the page and resubmit",
-            html.len(),
-            gauge::HTML_MAX_LEN
-        ));
-    }
-    let lower = html.to_lowercase();
-    if !lower.contains("<html") && !lower.contains("<body") {
-        return Err("html must be a complete self-contained HTML document".into());
-    }
-    let name = args
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Generated baseline")
-        .to_string();
-
-    let id = gauge::new_id("gen");
-    let baseline = gauge::Baseline {
-        id: id.clone(),
-        name,
-        notes: String::new(),
-        scores: Default::default(),
-        mime_type: "text/html".into(),
-        created_at: gauge::clock(),
-        kind: "generated".into(),
-        change_prompt: change_summary,
-    };
-    gauge::store_put(
-        gauge::BASELINES_COLLECTION,
-        &id,
-        serde_json::to_value(&baseline).map_err(|e| e.to_string())?,
-    )?;
-    gauge::store_put(
-        gauge::BASELINE_HTML_COLLECTION,
-        &id,
-        json!({ "html": html }),
-    )?;
-
-    // Close out the page's pending generation when this submission is it.
+    // The pending generation's brief/model belong on the stored page.
     let generation = gauge::generation_state();
     let pending_session = generation
         .get("session_id")
@@ -249,17 +58,151 @@ pub fn submit_baseline_tool(args: Value) -> Result<Value, String> {
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    if !pending_session.is_empty() && pending_session == caller {
+    let is_pending = !pending_session.is_empty() && pending_session == caller;
+
+    let id = gauge::new_id("page");
+    let page = Page {
+        id: id.clone(),
+        name: name.trim().to_string(),
+        brief: if is_pending {
+            generation
+                .get("brief")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        },
+        model: if is_pending {
+            generation
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        },
+        design_notes,
+        created_at: gauge::clock(),
+        elements,
+    };
+    gauge::store_put(
+        gauge::PAGES_COLLECTION,
+        &id,
+        serde_json::to_value(&page).map_err(|e| e.to_string())?,
+    )?;
+    gauge::store_put(gauge::PAGE_HTML_COLLECTION, &id, json!({ "html": html }))?;
+
+    // Prune beyond the cap, oldest first (page ids sort by clock prefix).
+    let mut keys: Vec<String> = gauge::store_list(gauge::PAGES_COLLECTION)?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    if keys.len() > gauge::PAGES_CAP {
+        keys.sort();
+        for k in keys.iter().take(keys.len() - gauge::PAGES_CAP) {
+            gauge::delete_page(k);
+        }
+    }
+
+    if is_pending {
         gauge::set_generation_state(json!({
             "status": "done",
             "session_id": pending_session,
-            "baseline_id": id,
+            "page_id": id,
             "finished_at": gauge::clock(),
         }));
     }
     Ok(json!({
         "ok": true,
-        "baseline_id": id,
-        "note": "stored; awaiting the user's 1-10 ratings on the UI Gauge page",
+        "page_id": id,
+        "note": "stored; awaiting the user's per-element feedback on the UI Gauge page",
     }))
+}
+
+/// `ui_gauge_prefs {}` — the composed UI preference prompt plus the starred
+/// reference list, for agents that want the taste profile explicitly
+/// (sessions in an enabled folder already receive it as a system-prompt
+/// block).
+pub fn prefs_tool(_args: Value) -> Result<Value, String> {
+    let pages = gauge::pages();
+    let feedback = gauge::all_feedback();
+    let pref = gauge::preference_prompt(&pages, &feedback, &shot_keys());
+    let references: Vec<Value> = pref
+        .ingredients
+        .iter()
+        .filter(|i| i.section == "reference")
+        .map(|i| {
+            json!({
+                "id": gauge::feedback_key(&i.page_id, &i.element_id),
+                "label": i.element_label,
+                "page": i.page_name,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "prompt": pref.text,
+        "references": references,
+        "instructions": "Apply every Do/Avoid line when building or judging UI for this \
+    user. Fetch one or two reference screenshots with ui_gauge_reference_image before \
+    designing UI similar to a starred element.",
+    }))
+}
+
+/// `ui_gauge_reference_image { id }` — one starred element's screenshot
+/// (base64), id as listed by ui_gauge_prefs / the injected prompt.
+pub fn reference_image_tool(args: Value) -> Result<Value, String> {
+    let id = require_str(&args, "id")?;
+    let img = gauge::store_get(gauge::SHOTS_COLLECTION, &id)?
+        .ok_or_else(|| format!("no reference screenshot '{id}' — list ids with ui_gauge_prefs"))?;
+    Ok(img)
+}
+
+/// `ui_gauge_history {}` — generated pages with their feedback, newest
+/// first. Lets an agent see what was tried and how the user reacted.
+pub fn history_tool(_args: Value) -> Result<Value, String> {
+    let pages = gauge::pages();
+    let feedback = gauge::all_feedback();
+    let mut out: Vec<Value> = pages
+        .iter()
+        .rev()
+        .take(25)
+        .map(|p| {
+            let fb: Vec<Value> = feedback
+                .iter()
+                .filter(|f| f.page_id == p.id)
+                .map(|f: &Feedback| {
+                    json!({
+                        "element_id": f.element_id,
+                        "verdict": f.verdict,
+                        "comment": f.comment,
+                        "starred": f.starred,
+                    })
+                })
+                .collect();
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "brief": p.brief,
+                "created_at": p.created_at,
+                "design_notes": p.design_notes,
+                "elements": p.elements,
+                "feedback": fb,
+            })
+        })
+        .collect();
+    out.shrink_to_fit();
+    Ok(json!({ "pages": out }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_str_rejects_blank() {
+        assert!(require_str(&json!({ "a": " " }), "a").is_err());
+        assert!(require_str(&json!({}), "a").is_err());
+        assert_eq!(require_str(&json!({ "a": "x" }), "a").unwrap(), "x");
+    }
 }

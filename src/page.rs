@@ -1,25 +1,27 @@
-//! The UI Gauge page: generate-a-baseline loop, baseline gallery with 1-10
-//! ranking sliders, the category/bar editor, the living overall baseline
-//! prompt, and the evaluation history. Served like the other plugin pages:
-//! public HTML shell on `GET /plugin-api/v1/ui-gauge`, authed JSON under
-//! `/api/plugin-ui/ui-gauge/*`, reached through the parent `plugin-ui-fetch`
-//! postMessage bridge. Uploaded images are downscaled client-side; generated
-//! baselines are agent-submitted HTML rendered in a script-less sandboxed
-//! frame.
+//! The UI Gauge page: a public shell route serving the HTML, and authed
+//! JSON routes under `/api/plugin-ui/ui-gauge` the page calls through the
+//! parent frame's fetch bridge.
+//!
+//! The page renders each generated page into a **sanitized shadow root**:
+//! the HTML is parsed with `DOMParser` (an inert document — nothing
+//! executes), `<script>` elements, `on*` attributes, and `javascript:`
+//! URLs are stripped, and the result is adopted into a shadow DOM. An
+//! iframe cannot work here: the plugin page itself runs in a sandboxed
+//! frame without `allow-same-origin`, and sandbox flags inherit, so a
+//! nested frame's document would be cross-origin and unmeasurable — the
+//! review overlay needs `[data-uig-id]` rects and the starred-element
+//! screenshot capture needs the live nodes.
 
 use serde_json::{Value, json};
 
-use crate::gauge::{
-    self, BASELINE_HTML_COLLECTION, BASELINE_IMAGES_COLLECTION, BASELINES_COLLECTION, Baseline,
-    Category,
-};
+use crate::gauge::{self, Feedback, PageElement};
 use crate::host::{HostFn, call_host};
 
 pub const PAGE_PATH: &str = "/plugin-api/v1/ui-gauge";
 const API_PREFIX: &str = "/api/plugin-ui/ui-gauge";
 
-/// Keep one image comfortably under the 256 KB store-document cap
-/// (base64 of 150 KB ≈ 200 KB, plus JSON overhead).
+/// Screenshot cap: base64 stays under the 256 KB store-document ceiling
+/// with headroom for the JSON envelope.
 const MAX_IMAGE_BASE64_LEN: usize = 200_000;
 
 pub fn serve_public(payload: Value) -> Result<Value, String> {
@@ -63,38 +65,33 @@ pub fn serve_authed(payload: Value) -> Result<Value, String> {
     let rest = path.strip_prefix(API_PREFIX).unwrap_or("");
     let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
 
-    // Mutating routes hold the cross-instance store lease (manifest
-    // `concurrency` > 1 runs calls on several wasm instances); the routes
-    // load whatever they modify inside themselves, so wrapping here keeps
-    // every read→modify→write atomic. Contended → a "busy" banner.
+    // Mutating routes with a read→modify→write hold the cross-instance
+    // store lease (manifest `concurrency` > 1 runs calls on several wasm
+    // instances). Contended → a "busy" banner.
     let locked = |f: &dyn Fn() -> Result<Value, String>| -> Result<Value, String> {
         gauge::try_with_store_lock(f)?.ok_or_else(|| gauge::BUSY_MSG.to_string())
     };
     let out = match (method.as_str(), segs.as_slice()) {
         ("GET", ["state"]) => state_route(),
         ("GET", ["pickers"]) => pickers_route(),
-        ("POST", ["categories"]) => categories_route(&body),
         ("POST", ["generate"]) => locked(&|| generate_route(&body)),
-        ("POST", ["baselines"]) => locked(&|| create_baseline_route(&body)),
-        ("POST", ["baselines", id]) => locked(&|| update_baseline_route(id, &body)),
-        ("POST", ["baselines", id, "delete"]) => {
-            gauge::store_delete(BASELINES_COLLECTION, id);
-            gauge::store_delete(BASELINE_IMAGES_COLLECTION, id);
-            gauge::store_delete(BASELINE_HTML_COLLECTION, id);
-            Ok(json_response(200, json!({ "ok": true })))
-        }
-        ("GET", ["baselines", id, "image"]) => {
-            match gauge::store_get(BASELINE_IMAGES_COLLECTION, id)? {
-                Some(img) => Ok(json_response(200, img)),
-                None => Ok(json_response(404, json!({ "error": "no image" }))),
-            }
-        }
-        ("GET", ["baselines", id, "html"]) => {
-            match gauge::store_get(BASELINE_HTML_COLLECTION, id)? {
+        ("POST", ["feedback"]) => locked(&|| feedback_route(&body)),
+        ("POST", ["shots"]) => shots_route(&body),
+        ("POST", ["folders"]) => folders_route(&body),
+        ("GET", ["pages", id, "html"]) => {
+            match gauge::store_get(gauge::PAGE_HTML_COLLECTION, id)? {
                 Some(html) => Ok(json_response(200, html)),
                 None => Ok(json_response(404, json!({ "error": "no html" }))),
             }
         }
+        ("POST", ["pages", id, "delete"]) => {
+            gauge::delete_page(id);
+            Ok(json_response(200, json!({ "ok": true })))
+        }
+        ("GET", ["shots", id]) => match gauge::store_get(gauge::SHOTS_COLLECTION, id)? {
+            Some(img) => Ok(json_response(200, img)),
+            None => Ok(json_response(404, json!({ "error": "no shot" }))),
+        },
         _ => Ok(json_response(404, json!({ "error": "no such route" }))),
     };
     Ok(out.unwrap_or_else(|e| json_response(400, json!({ "error": e }))))
@@ -118,73 +115,86 @@ fn pickers_route() -> Result<Value, String> {
 }
 
 fn state_route() -> Result<Value, String> {
-    let cats = gauge::categories();
-    let baselines = gauge::baselines();
-    let categories: Vec<Value> = cats
+    let pages = gauge::pages();
+    let feedback = gauge::all_feedback();
+    let shot_keys: std::collections::BTreeSet<String> = gauge::store_list(gauge::SHOTS_COLLECTION)?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let pref = gauge::preference_prompt(&pages, &feedback, &shot_keys);
+
+    let page_views: Vec<Value> = pages
         .iter()
-        .map(|c| {
+        .map(|p| {
+            let mut fb_map = serde_json::Map::new();
+            for f in feedback.iter().filter(|f| f.page_id == p.id) {
+                let key = gauge::feedback_key(&f.page_id, &f.element_id);
+                fb_map.insert(
+                    f.element_id.clone(),
+                    json!({
+                        "verdict": f.verdict,
+                        "comment": f.comment,
+                        "starred": f.starred,
+                        "star_dismissed": f.star_dismissed,
+                        "has_shot": shot_keys.contains(&key),
+                    }),
+                );
+            }
             json!({
-                "key": c.key,
-                "label": c.label,
-                "bar_override": c.bar_override,
-                "bar": gauge::bar_for(c, &baselines),
+                "id": p.id,
+                "name": p.name,
+                "brief": p.brief,
+                "model": p.model,
+                "design_notes": p.design_notes,
+                "created_at": p.created_at,
+                "elements": p.elements,
+                "feedback": fb_map,
             })
         })
         .collect();
-    let overall = gauge::overall_prompt(&baselines);
-    let baseline_views: Vec<Value> = baselines
-        .iter()
-        .map(|b| {
-            let mut v = serde_json::to_value(b).unwrap_or(Value::Null);
-            if let Some(map) = v.as_object_mut() {
-                map.insert("avg".into(), json!(b.avg_score()));
-            }
-            v
+
+    // Folder list with each folder's toggle; ListFolders degrades to empty.
+    let prefs: std::collections::BTreeMap<String, bool> =
+        gauge::store_list(gauge::FOLDER_PREFS_COLLECTION)?
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false),
+                )
+            })
+            .collect();
+    let folders: Vec<Value> = call_host(HostFn::ListFolders, &json!({}))
+        .ok()
+        .and_then(|v| v.get("folders").cloned())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|f| {
+            let id = f.get("id")?.as_str()?.to_string();
+            let name = f.get("name").and_then(|n| n.as_str()).unwrap_or(&id);
+            Some(json!({
+                "id": id,
+                "name": name,
+                "enabled": prefs.get(&id).copied().unwrap_or(false),
+            }))
         })
         .collect();
-    let mut evals = gauge::evaluations(None);
-    evals.truncate(50);
+
     Ok(json_response(
         200,
         json!({
-            "categories": categories,
-            "baselines": baseline_views,
-            "evaluations": evals,
-            "overall_prompt": overall,
+            "pages": page_views,
             "generation": gauge::generation_state(),
+            "folders": folders,
+            "prompt": { "text": pref.text, "ingredients": pref.ingredients },
         }),
     ))
 }
 
-fn categories_route(body: &Value) -> Result<Value, String> {
-    let cats: Vec<Category> = serde_json::from_value(
-        body.get("categories")
-            .cloned()
-            .ok_or("'categories' required")?,
-    )
-    .map_err(|e| format!("bad categories: {e}"))?;
-    if cats.is_empty() {
-        return Err("at least one category is required".into());
-    }
-    for c in &cats {
-        if c.key.trim().is_empty() || c.label.trim().is_empty() {
-            return Err("category key and label must not be blank".into());
-        }
-        if !c
-            .key
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-        {
-            return Err(format!("category key '{}' must be lower_snake_case", c.key));
-        }
-    }
-    gauge::save_categories(&cats)?;
-    Ok(json_response(200, json!({ "ok": true })))
-}
-
-/// The button: spawn a temp generation session in the chosen folder with the
-/// chosen model, hand it the iteration prompt, and record the pending
-/// generation. The session submits back via `ui_gauge_submit_baseline`.
+/// The button: spawn a temp generation session in the chosen folder with
+/// the chosen model, hand it the taste-aware prompt, and record the pending
+/// generation. The session submits back via `ui_gauge_submit_page`.
 fn generate_route(body: &Value) -> Result<Value, String> {
     let generation = gauge::generation_state();
     if generation.get("status").and_then(|s| s.as_str()) == Some("running") {
@@ -203,7 +213,13 @@ fn generate_route(body: &Value) -> Result<Value, String> {
         .get("model")
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
-        .ok_or("'model' is required — pick the model that generates the baseline")?;
+        .ok_or("'model' is required — pick the model that generates the page")?;
+    let brief = body
+        .get("brief")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
     // create_session's authed path takes a folder *path*; resolve the picked id.
     let folders = call_host(HostFn::ListFolders, &json!({}))?;
@@ -218,17 +234,18 @@ fn generate_route(body: &Value) -> Result<Value, String> {
         .ok_or_else(|| format!("folder not found: {folder_id}"))?
         .to_string();
 
-    let baselines = gauge::baselines();
-    let iteration = baselines.iter().filter(|b| b.kind == "generated").count() + 1;
+    let pages = gauge::pages();
+    let feedback = gauge::all_feedback();
+    let iteration = pages.len() + 1;
     let created = call_host(
         HostFn::CreateSession,
         &json!({
-            "name": format!("UI Gauge baseline #{iteration}"),
+            "name": format!("UI Gauge page #{iteration}"),
             "model": model,
             "is_temp": true,
             "folder_path": folder_path,
-            "system_prompt": "You generate one baseline UI iteration for the ui-gauge plugin \
-        and submit it via the ui_gauge_submit_baseline MCP tool. Follow the task prompt exactly; \
+            "system_prompt": "You generate one UI page for the ui-gauge plugin and submit \
+        it via the ui_gauge_submit_page MCP tool. Follow the task prompt exactly; \
         do not ask the user questions.",
         }),
     )?;
@@ -243,13 +260,14 @@ fn generate_route(body: &Value) -> Result<Value, String> {
         HostFn::DispatchCapture,
         &json!({
             "session_id": session_id,
-            "prompt": gauge::build_generation_prompt(&baselines),
+            "prompt": gauge::build_generation_prompt(&brief, &pages, &feedback),
         }),
     )?;
     gauge::set_generation_state(json!({
         "status": "running",
         "session_id": session_id,
         "model": model,
+        "brief": brief,
         "started_at": gauge::clock(),
     }));
     Ok(json_response(
@@ -258,28 +276,85 @@ fn generate_route(body: &Value) -> Result<Value, String> {
     ))
 }
 
-fn parse_scores(v: Option<&Value>) -> std::collections::BTreeMap<String, u8> {
-    v.and_then(|s| s.as_object())
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| {
-                    v.as_u64()
-                        .filter(|n| (1..=10).contains(n))
-                        .map(|n| (k.clone(), n as u8))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// Look up a page and check the element id belongs to it (or is the
+/// page-level pseudo element).
+fn checked_element(page_id: &str, element_id: &str) -> Result<(), String> {
+    let page: gauge::Page = gauge::store_get(gauge::PAGES_COLLECTION, page_id)?
+        .and_then(|v| serde_json::from_value(v).ok())
+        .ok_or_else(|| format!("no page '{page_id}'"))?;
+    if element_id != gauge::PAGE_ELEMENT_ID
+        && !page
+            .elements
+            .iter()
+            .any(|e: &PageElement| e.id == element_id)
+    {
+        return Err(format!("page '{page_id}' has no element '{element_id}'"));
+    }
+    Ok(())
 }
 
-fn create_baseline_route(body: &Value) -> Result<Value, String> {
-    let name = body
-        .get("name")
+/// Partial update of one element's feedback: only the keys present in the
+/// body change; the rest carries over.
+fn feedback_route(body: &Value) -> Result<Value, String> {
+    let page_id = body
+        .get("page_id")
         .and_then(|v| v.as_str())
-        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or("'name' is required")?
-        .to_string();
+        .ok_or("'page_id' is required")?;
+    let element_id = body
+        .get("element_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'element_id' is required")?;
+    checked_element(page_id, element_id)?;
+
+    let key = gauge::feedback_key(page_id, element_id);
+    let mut fb: Feedback = gauge::store_get(gauge::FEEDBACK_COLLECTION, &key)?
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    fb.page_id = page_id.to_string();
+    fb.element_id = element_id.to_string();
+    if let Some(v) = body.get("verdict").and_then(|v| v.as_str()) {
+        if !["up", "down", ""].contains(&v) {
+            return Err("'verdict' must be \"up\", \"down\", or \"\"".into());
+        }
+        fb.verdict = v.to_string();
+    }
+    if let Some(c) = body.get("comment").and_then(|v| v.as_str()) {
+        fb.comment = c.chars().take(2000).collect();
+    }
+    if let Some(s) = body.get("starred").and_then(|v| v.as_bool()) {
+        fb.starred = s;
+    }
+    if let Some(d) = body.get("star_dismissed").and_then(|v| v.as_bool()) {
+        fb.star_dismissed = d;
+    }
+    fb.updated_at = gauge::clock();
+    gauge::store_put(
+        gauge::FEEDBACK_COLLECTION,
+        &key,
+        serde_json::to_value(&fb).map_err(|e| e.to_string())?,
+    )?;
+    Ok(json_response(
+        200,
+        json!({ "ok": true, "feedback": serde_json::to_value(&fb).map_err(|e| e.to_string())? }),
+    ))
+}
+
+/// Store a captured element screenshot (the page captures client-side and
+/// downscales before posting).
+fn shots_route(body: &Value) -> Result<Value, String> {
+    let page_id = body
+        .get("page_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'page_id' is required")?;
+    let element_id = body
+        .get("element_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'element_id' is required")?;
+    checked_element(page_id, element_id)?;
     let image_base64 = body
         .get("image_base64")
         .and_then(|v| v.as_str())
@@ -287,66 +362,42 @@ fn create_baseline_route(body: &Value) -> Result<Value, String> {
         .ok_or("'image_base64' is required")?;
     if image_base64.len() > MAX_IMAGE_BASE64_LEN {
         return Err(format!(
-            "image too large ({} chars base64, max {MAX_IMAGE_BASE64_LEN}) — the page \
-             should have downscaled it; try a smaller screenshot",
+            "screenshot too large ({} chars base64, max {MAX_IMAGE_BASE64_LEN})",
             image_base64.len()
         ));
     }
     let mime_type = body
         .get("mime_type")
         .and_then(|v| v.as_str())
-        .unwrap_or("image/jpeg")
-        .to_string();
-    let id = gauge::new_id("base");
-    let baseline = Baseline {
-        id: id.clone(),
-        name,
-        notes: body
-            .get("notes")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        scores: parse_scores(body.get("scores")),
-        mime_type: mime_type.clone(),
-        created_at: gauge::clock(),
-        kind: "image".into(),
-        change_prompt: String::new(),
-    };
+        .unwrap_or("image/jpeg");
     gauge::store_put(
-        BASELINES_COLLECTION,
-        &id,
-        serde_json::to_value(&baseline).map_err(|e| e.to_string())?,
+        gauge::SHOTS_COLLECTION,
+        &gauge::feedback_key(page_id, element_id),
+        json!({
+            "image_base64": image_base64,
+            "mime_type": mime_type,
+            "captured_at": gauge::clock(),
+        }),
     )?;
-    gauge::store_put(
-        BASELINE_IMAGES_COLLECTION,
-        &id,
-        json!({ "image_base64": image_base64, "mime_type": mime_type }),
-    )?;
-    Ok(json_response(200, json!({ "ok": true, "id": id })))
+    Ok(json_response(200, json!({ "ok": true })))
 }
 
-/// Rating writes: the overall prompt recomputes on every read, so saving new
-/// scores here is all "keeping it up to date" requires.
-fn update_baseline_route(id: &str, body: &Value) -> Result<Value, String> {
-    let mut b: Baseline = gauge::store_get(BASELINES_COLLECTION, id)?
-        .and_then(|v| serde_json::from_value(v).ok())
-        .ok_or_else(|| format!("baseline not found: {id}"))?;
-    if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
-        if name.trim().is_empty() {
-            return Err("name must not be blank".into());
-        }
-        b.name = name.trim().to_string();
-    }
-    if let Some(notes) = body.get("notes").and_then(|v| v.as_str()) {
-        b.notes = notes.to_string();
-    }
-    if body.get("scores").is_some() {
-        b.scores = parse_scores(body.get("scores"));
-    }
+/// Toggle the preference prompt for a folder. Sessions pick the change up
+/// on their next turn (`session.message.before` syncs the block).
+fn folders_route(body: &Value) -> Result<Value, String> {
+    let folder_id = body
+        .get("folder_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'folder_id' is required")?;
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or("'enabled' (boolean) is required")?;
     gauge::store_put(
-        BASELINES_COLLECTION,
-        id,
-        serde_json::to_value(&b).map_err(|e| e.to_string())?,
+        gauge::FOLDER_PREFS_COLLECTION,
+        folder_id,
+        json!({ "enabled": enabled }),
     )?;
     Ok(json_response(200, json!({ "ok": true })))
 }
@@ -377,35 +428,43 @@ const PAGE_HTML: &str = r##"<!doctype html>
            background: var(--card); color: var(--text); cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button.danger { color: var(--bad); }
+  button.active { border-color: var(--accent); color: var(--accent); }
   button:disabled { opacity: .5; cursor: default; }
-  input[type=text], textarea, select { width: 100%; padding: 6px 8px; border: 1px solid var(--line);
+  input[type=text], textarea, select { padding: 6px 8px; border: 1px solid var(--line);
     border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
-  input[type=number] { width: 64px; padding: 4px 6px; border: 1px solid var(--line);
-    border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { color: var(--muted); font-weight: 500; }
   .muted { color: var(--muted); font-size: 12px; }
   .error-banner { color: var(--bad); margin: 8px 0; }
-  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
-  .baseline img, .baseline iframe { width: 100%; height: 210px; border-radius: 8px;
-    border: 1px solid var(--line); background: #fff; object-fit: cover; }
-  .baseline iframe { pointer-events: none; }
-  .slider-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
-  .slider-row label { flex: 1; font-size: 12px; color: var(--muted); }
-  .slider-row input[type=range] { flex: 2; }
-  .slider-row output { width: 20px; text-align: right; font-weight: 600; }
-  .verdict-pass { color: var(--ok); font-weight: 600; }
-  .verdict-subpar { color: var(--bad); font-weight: 600; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .chip { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px;
           border: 1px solid var(--line); color: var(--muted); }
   .chip.ok { color: var(--ok); border-color: var(--ok); }
   .chip.warn { color: var(--warn); border-color: var(--warn); }
   pre.prompt { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line);
-    border-radius: 8px; padding: 10px; font-size: 12px; max-height: 280px; overflow: auto; }
-  .change { font-size: 12px; border-left: 3px solid var(--accent); padding: 4px 8px;
-    margin: 6px 0; color: var(--muted); }
+    border-radius: 8px; padding: 10px; font-size: 12px; max-height: 320px; overflow: auto; }
+  .folder-row { display: flex; gap: 10px; align-items: center; padding: 6px 0;
+    border-bottom: 1px solid var(--line); }
+  .folder-row:last-child { border-bottom: 0; }
+  .pages { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  .page-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+  .page-card.open { border-color: var(--accent); }
+  .review { display: flex; gap: 12px; align-items: flex-start; }
+  .review-doc { flex: 1 1 60%; position: relative; min-width: 0; }
+  #review-host { border: 1px solid var(--line); border-radius: 8px; background: #fff;
+    overflow: hidden; }
+  .overlay { position: absolute; inset: 0; pointer-events: none; }
+  .pin { position: absolute; pointer-events: auto; cursor: pointer; min-width: 20px; height: 20px;
+    padding: 0 5px; border-radius: 10px; background: var(--accent); color: #fff; font-size: 12px;
+    line-height: 20px; text-align: center; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.35);
+    transform: translate(-6px, -6px); }
+  .pin.done { background: var(--ok); }
+  .pin.down { background: var(--bad); }
+  .hl { position: absolute; border: 2px solid var(--accent); border-radius: 6px;
+    pointer-events: none; display: none; }
+  .rail { flex: 1 1 40%; max-width: 400px; max-height: 80vh; overflow: auto; }
+  .el { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; }
+  .el.sel { border-color: var(--accent); }
+  .el textarea { width: 100%; min-height: 44px; margin-top: 6px; }
+  .star { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -417,55 +476,58 @@ const PAGE_HTML: &str = r##"<!doctype html>
 <div id="banner" class="error-banner" style="display:none"></div>
 
 <div class="card">
-  <h2>Generate a baseline</h2>
-  <div class="muted">One button press spawns a temp agent session that designs the next baseline UI —
-  it applies every directive you have already validated, changes one aspect, and explains the change.
-  Rate the result below: 7+ average folds the change into the overall prompt; 4− marks it as one to avoid.</div>
+  <h2>Generate a page</h2>
+  <div class="muted">Spawns a temp agent session that designs one HTML page with every element
+  marked for review. It applies all the preferences you have recorded so far. Leave the brief
+  empty to let the agent pick a representative page type.</div>
   <div class="row" style="margin-top:8px">
     <select id="g-folder" style="flex:1" data-testid="gauge-gen-folder"></select>
     <select id="g-model" style="flex:1" data-testid="gauge-gen-model"></select>
-    <button class="primary" id="g-btn" data-testid="gauge-generate">Generate baseline</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <input type="text" id="g-brief" placeholder="Optional brief, e.g. 'a settings page' — empty = agent's pick" style="flex:1" data-testid="gauge-gen-brief">
+    <button class="primary" id="g-btn" data-testid="gauge-generate">Generate page</button>
   </div>
   <div id="g-status" class="muted" style="margin-top:6px" data-testid="gauge-gen-status"></div>
 </div>
 
 <div class="card">
-  <h2>Overall baseline prompt</h2>
-  <div class="muted">Your validated style directives — rebuilt automatically from every generated
-  baseline you rated 7+/10 (re-rating updates it instantly). Agents get it from ui_gauge_rubric.</div>
-  <pre class="prompt" id="overall" data-testid="gauge-overall"></pre>
-</div>
-
-<div class="card">
-  <h2>Categories &amp; bars</h2>
-  <div class="muted">The bar per category defaults to the median of your baseline rankings; set an override to pin it. Work scoring below a bar is subpar and creates follow-up cards.</div>
-  <table id="cats"></table>
+  <h2>Preference prompt</h2>
+  <div class="muted">Composed from your per-element feedback — this exact text is attached to
+  chat sessions in every folder you enable below (workers are not covered by the hook).
+  Starred elements are listed as visual references agents fetch with ui_gauge_reference_image.</div>
+  <pre class="prompt" id="prompt" data-testid="gauge-prompt"></pre>
+  <details>
+    <summary class="muted">What feeds each line</summary>
+    <div id="ingredients" data-testid="gauge-ingredients"></div>
+  </details>
   <div class="row" style="margin-top:8px">
-    <button id="cat-add">Add category</button>
-    <button class="primary" id="cat-save" data-testid="gauge-save-cats">Save categories</button>
+    <button id="copy-prompt" data-testid="gauge-copy-prompt">Copy prompt</button>
+    <span id="copy-done" class="chip ok" style="display:none">copied</span>
   </div>
+  <h2 style="margin-top:14px">Folders</h2>
+  <div id="folders" data-testid="gauge-folders"></div>
 </div>
 
 <div class="card">
-  <h2>Add a screenshot baseline</h2>
-  <div class="muted">Upload a reference screenshot and rank it 1-10 per category. These rankings calibrate the agent's scoring to YOUR scale. Images are downscaled to fit storage.</div>
-  <div class="row" style="margin:8px 0">
-    <input type="file" id="b-file" accept="image/*" data-testid="gauge-file">
-    <input type="text" id="b-name" placeholder="Name, e.g. 'Settings page — good'" style="flex:1" data-testid="gauge-base-name">
+  <h2>Generated pages</h2>
+  <div id="pages" class="pages"></div>
+</div>
+
+<div class="card" id="review-card" style="display:none">
+  <div class="row" style="justify-content:space-between">
+    <h2 id="review-title"></h2>
+    <button id="review-close">Close review</button>
   </div>
-  <input type="text" id="b-notes" placeholder="Notes (optional): what makes this reference rank where it does">
-  <div id="b-sliders" style="margin-top:8px"></div>
-  <button class="primary" id="b-save" style="margin-top:8px" data-testid="gauge-base-save">Add baseline</button>
-</div>
-
-<div class="card">
-  <h2>Baselines</h2>
-  <div id="gallery" class="gallery"></div>
-</div>
-
-<div class="card">
-  <h2>Evaluation history</h2>
-  <table id="evals"></table>
+  <div id="review-notes" class="muted" style="margin-bottom:8px"></div>
+  <div class="review" data-testid="gauge-review">
+    <div class="review-doc" id="review-doc">
+      <div id="review-host"></div>
+      <div class="overlay" id="overlay"></div>
+      <div class="hl" id="hl"></div>
+    </div>
+    <div class="rail" id="rail"></div>
+  </div>
 </div>
 
 <script>
@@ -499,9 +561,10 @@ const BASE = "/api/plugin-ui/ui-gauge";
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
   (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-let STATE = { categories: [], baselines: [], evaluations: [], overall_prompt: "", generation: { status: "idle" } };
+let STATE = { pages: [], generation: { status: "idle" }, folders: [], prompt: { text: "", ingredients: [] } };
 let PICKERS = { folders: [], models: [] };
-const imgCache = {};
+let OPEN = null;          // page id under review
+let SHADOW = null;        // shadow root holding the sanitized rendered page
 const htmlCache = {};
 
 function banner(msg) {
@@ -509,6 +572,8 @@ function banner(msg) {
   el.style.display = msg ? "" : "none";
   el.textContent = msg || "";
 }
+function openPage() { return STATE.pages.find((p) => p.id === OPEN) || null; }
+function fb(page, elId) { return (page.feedback || {})[elId] || {}; }
 
 function renderGenerate() {
   const f = document.getElementById("g-folder");
@@ -524,219 +589,429 @@ function renderGenerate() {
   const g = STATE.generation || {};
   const st = document.getElementById("g-status");
   document.getElementById("g-btn").disabled = g.status === "running";
-  if (g.status === "running") st.textContent = "Generating… the agent session is designing the next baseline (press Refresh to check on it).";
-  else if (g.status === "done") st.textContent = "Last generation submitted a baseline — rate it below.";
-  else if (g.status === "ended") st.textContent = "The last generation session ended WITHOUT submitting a baseline — try again (a stronger model helps).";
+  if (g.status === "running") st.textContent = "Generating… the agent session is designing the page (press Refresh to check on it).";
+  else if (g.status === "done") st.textContent = "Last generation submitted a page — review it below.";
+  else if (g.status === "ended") st.textContent = "The last generation session ended WITHOUT submitting a page — try again (a stronger model helps).";
   else st.textContent = "";
 }
 
-function renderOverall() {
-  document.getElementById("overall").textContent = STATE.overall_prompt || "";
+function renderPrompt() {
+  document.getElementById("prompt").textContent = STATE.prompt.text || "";
+  const ing = STATE.prompt.ingredients || [];
+  document.getElementById("ingredients").innerHTML = !ing.length
+    ? '<div class="muted">Nothing yet — review a generated page below.</div>'
+    : ing.map((i) =>
+        '<div class="muted" style="margin:3px 0">[' + esc(i.section) + '] ' + esc(i.line) +
+        ' <span style="opacity:.7">&larr; ' + esc(i.page_name) + ' &rsaquo; ' + esc(i.element_label) + '</span></div>'
+      ).join("");
+  document.getElementById("folders").innerHTML = !STATE.folders.length
+    ? '<div class="muted">No folders.</div>'
+    : STATE.folders.map((f) =>
+        '<div class="folder-row" data-testid="gauge-folder-row">' +
+        '<label style="flex:1"><input type="checkbox" data-folder="' + esc(f.id) + '"' +
+        (f.enabled ? " checked" : "") + ' data-testid="gauge-folder-toggle"> ' + esc(f.name) + '</label>' +
+        '<span class="chip' + (f.enabled ? " ok" : "") + '">' +
+        (f.enabled ? "prompt attached to this folder's chat sessions" : "off") + '</span>' +
+        '</div>'
+      ).join("");
 }
 
-function renderCats() {
-  const t = document.getElementById("cats");
-  t.innerHTML = "<tr><th>Key (lower_snake_case)</th><th>Label</th><th>Bar override</th><th>Effective bar</th><th></th></tr>" +
-    STATE.categories.map((c, i) =>
-      '<tr>' +
-      '<td><input type="text" data-cat-key="' + i + '" value="' + esc(c.key) + '"></td>' +
-      '<td><input type="text" data-cat-label="' + i + '" value="' + esc(c.label) + '"></td>' +
-      '<td><input type="number" min="1" max="10" data-cat-bar="' + i + '" value="' + (c.bar_override == null ? "" : c.bar_override) + '" placeholder="auto"></td>' +
-      '<td><b>' + c.bar + '</b></td>' +
-      '<td><button class="danger" data-cat-del="' + i + '">remove</button></td>' +
-      '</tr>').join("");
+function renderPages() {
+  const el = document.getElementById("pages");
+  if (!STATE.pages.length) {
+    el.innerHTML = '<div class="muted">No pages yet — press Generate page.</div>';
+    return;
+  }
+  el.innerHTML = STATE.pages.slice().reverse().map((p) => {
+    const total = (p.elements || []).length;
+    const reviewed = (p.elements || []).filter((e) => {
+      const f = fb(p, e.id);
+      return f.verdict === "up" || f.verdict === "down" || (f.comment || "").trim();
+    }).length;
+    const chip = reviewed >= total && total > 0
+      ? '<span class="chip ok">reviewed ' + reviewed + "/" + total + '</span>'
+      : '<span class="chip' + (reviewed ? "" : " warn") + '">reviewed ' + reviewed + "/" + total + '</span>';
+    return '<div class="page-card' + (p.id === OPEN ? " open" : "") + '" data-testid="gauge-page">' +
+      '<div class="row" style="justify-content:space-between"><b>' + esc(p.name) + '</b>' + chip + '</div>' +
+      (p.brief ? '<div class="muted">brief: ' + esc(p.brief) + '</div>' : "") +
+      '<div class="muted">' + esc((p.created_at || "").replace("T", " ").slice(0, 16)) +
+      (p.model ? " · " + esc(p.model) : "") + '</div>' +
+      '<div class="row" style="margin-top:6px">' +
+      '<button class="primary" data-open="' + esc(p.id) + '" data-testid="gauge-open-review">Review</button>' +
+      '<button class="danger" data-del="' + esc(p.id) + '" data-testid="gauge-delete-page">Delete</button>' +
+      '</div></div>';
+  }).join("");
 }
-function sliderRows(prefix, scores) {
-  return STATE.categories.map((c) =>
-    '<div class="slider-row"><label>' + esc(c.label) + '</label>' +
-    '<input type="range" min="1" max="10" value="' + ((scores || {})[c.key] || 5) + '" data-' + prefix + '="' + esc(c.key) + '" ' +
-    'oninput="this.nextElementSibling.value=this.value">' +
-    '<output>' + ((scores || {})[c.key] || 5) + '</output></div>').join("");
-}
-function renderNewBaselineSliders() {
-  document.getElementById("b-sliders").innerHTML = sliderRows("newscore", {});
-}
-async function loadImage(id) {
-  if (imgCache[id]) return imgCache[id];
-  try {
-    const r = await api("GET", BASE + "/baselines/" + id + "/image");
-    imgCache[id] = "data:" + (r.mime_type || "image/jpeg") + ";base64," + r.image_base64;
-  } catch (_) { imgCache[id] = ""; }
-  return imgCache[id];
-}
+
+// ── The review view ──────────────────────────────────────────────────
+
 async function loadHtml(id) {
   if (htmlCache[id]) return htmlCache[id];
   try {
-    const r = await api("GET", BASE + "/baselines/" + id + "/html");
+    const r = await api("GET", BASE + "/pages/" + id + "/html");
     htmlCache[id] = r.html || "";
   } catch (_) { htmlCache[id] = ""; }
   return htmlCache[id];
 }
-function renderGallery() {
-  const g = document.getElementById("gallery");
-  if (!STATE.baselines.length) {
-    g.innerHTML = '<div class="muted">No baselines yet — press Generate baseline, or upload reference screenshots.</div>';
-    return;
-  }
-  g.innerHTML = STATE.baselines.slice().reverse().map((b) => {
-    const rated = b.avg != null;
-    const chip = !rated ? '<span class="chip warn">unrated</span>' :
-      '<span class="chip' + (b.avg >= 7 ? ' ok' : '') + '">avg ' + b.avg.toFixed(1) + (b.avg >= 7 && b.kind === 'generated' ? ' → in overall prompt' : '') + '</span>';
-    const preview = b.kind === 'generated'
-      ? '<iframe sandbox="" data-html="' + esc(b.id) + '" title="' + esc(b.name) + '"></iframe>'
-      : '<img data-img="' + esc(b.id) + '" alt="' + esc(b.name) + '">';
-    return '<div class="baseline card" data-testid="gauge-baseline" data-base="' + esc(b.id) + '">' +
-      preview +
-      '<div class="row"><b>' + esc(b.name) + '</b>' + chip + '</div>' +
-      (b.kind === 'generated' && b.change_prompt ?
-        '<div class="change" data-testid="gauge-change">' + esc(b.change_prompt) + '</div>' : "") +
-      (b.notes ? '<div class="muted">' + esc(b.notes) + '</div>' : "") +
-      sliderRows("score-" + b.id, b.scores) +
-      '<div class="row" style="margin-top:6px">' +
-      '<button class="primary" data-base-save="' + esc(b.id) + '">Save rankings</button>' +
-      '<button class="danger" data-base-del="' + esc(b.id) + '">Delete</button>' +
-      '</div></div>';
-  }).join("");
-  STATE.baselines.forEach(async (b) => {
-    if (b.kind === 'generated') {
-      const el = g.querySelector('iframe[data-html="' + b.id + '"]');
-      if (el) el.srcdoc = await loadHtml(b.id);
-    } else {
-      const el = g.querySelector('img[data-img="' + b.id + '"]');
-      if (el) el.src = await loadImage(b.id);
+
+function pinClass(f) {
+  if (f.verdict === "down") return "pin down";
+  if (f.verdict === "up" || (f.comment || "").trim()) return "pin done";
+  return "pin";
+}
+
+// DOMParser gives an inert document — scripts never execute there. Strip
+// everything that could run once the nodes go live (defense in depth: the
+// submission tool already rejects <script>), then adopt into the shadow
+// root. `body {...}` rules can't match inside a shadow tree, so they are
+// retargeted at the wrapper.
+function sanitizeGeneratedHtml(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("script").forEach((n) => n.remove());
+  doc.querySelectorAll("*").forEach((n) => {
+    for (const a of Array.from(n.attributes)) {
+      const name = a.name.toLowerCase();
+      if (name.startsWith("on")) n.removeAttribute(a.name);
+      else if ((name === "href" || name === "src" || name === "xlink:href") &&
+               a.value.trim().toLowerCase().startsWith("javascript:")) n.removeAttribute(a.name);
     }
   });
+  return doc;
 }
-function renderEvals() {
-  const t = document.getElementById("evals");
-  if (!STATE.evaluations.length) {
-    t.innerHTML = '<tr><td class="muted">No evaluations yet — agents submit them via ui_gauge_score.</td></tr>';
-    return;
+
+function renderDoc(html) {
+  const host = document.getElementById("review-host");
+  if (!host.shadowRoot) host.attachShadow({ mode: "open" });
+  SHADOW = host.shadowRoot;
+  const doc = sanitizeGeneratedHtml(html);
+  const styles = Array.from(doc.querySelectorAll("style"))
+    .map((s) => s.textContent.replace(/(^|[\s,{}])body\b/g, "$1.uig-body")).join("\n");
+  const wrap = document.createElement("div");
+  wrap.className = "uig-body";
+  if (doc.body) {
+    const bodyStyle = doc.body.getAttribute("style");
+    if (bodyStyle) wrap.setAttribute("style", bodyStyle);
+    while (doc.body.firstChild) wrap.appendChild(doc.body.firstChild);
   }
-  t.innerHTML = "<tr><th>When</th><th>Target</th><th>Verdict</th><th>Scores</th><th>Gaps / cards</th></tr>" +
-    STATE.evaluations.map((e) => {
-      const scores = Object.entries(e.scores || {}).map(([k, v]) => k + ":" + v).join(" ");
-      const gaps = (e.gaps || []).map((g) => g.label + " " + g.score + "<" + g.bar).join(", ");
-      const cards = (e.cards_created || []).length;
-      return '<tr data-testid="gauge-eval">' +
-        '<td>' + esc((e.ts || "").replace("T", " ").slice(0, 16)) + '</td>' +
-        '<td>' + esc(e.target) + '</td>' +
-        '<td class="verdict-' + esc(e.verdict) + '">' + esc(e.verdict) + '</td>' +
-        '<td class="muted">' + esc(scores) + '</td>' +
-        '<td>' + esc(gaps || "—") + (cards ? ' <span class="muted">(' + cards + ' card(s))</span>' : "") + '</td>' +
-        '</tr>';
-    }).join("");
+  SHADOW.innerHTML = "";
+  const styleEl = document.createElement("style");
+  styleEl.textContent = styles;
+  SHADOW.appendChild(styleEl);
+  SHADOW.appendChild(wrap);
 }
-function render() { renderGenerate(); renderOverall(); renderCats(); renderNewBaselineSliders(); renderGallery(); renderEvals(); }
+
+function elementRect(id) {
+  if (!SHADOW) return null;
+  const el = SHADOW.querySelector('[data-uig-id="' + CSS.escape(id) + '"]');
+  if (!el) return null;
+  const doc = document.getElementById("review-doc").getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  return { left: r.left - doc.left, top: r.top - doc.top, width: r.width, height: r.height, el };
+}
+
+function renderOverlay() {
+  const page = openPage();
+  const overlay = document.getElementById("overlay");
+  overlay.innerHTML = "";
+  if (!page) return;
+  (page.elements || []).forEach((e, i) => {
+    const r = elementRect(e.id);
+    if (!r) return;
+    const pin = document.createElement("div");
+    pin.className = pinClass(fb(page, e.id));
+    pin.textContent = String(i + 1);
+    pin.title = e.label;
+    pin.style.left = r.left + "px";
+    pin.style.top = r.top + "px";
+    pin.dataset.el = e.id;
+    pin.setAttribute("data-testid", "gauge-pin");
+    pin.onclick = () => selectElement(e.id, true);
+    overlay.appendChild(pin);
+  });
+}
+
+function selectElement(id, scrollRail) {
+  const page = openPage();
+  if (!page) return;
+  document.querySelectorAll(".el").forEach((el) => el.classList.toggle("sel", el.dataset.el === id));
+  const hl = document.getElementById("hl");
+  const r = id === "_page" ? null : elementRect(id);
+  if (r) {
+    hl.style.display = "";
+    hl.style.left = (r.left - 2) + "px";
+    hl.style.top = (r.top - 2) + "px";
+    hl.style.width = (r.width) + "px";
+    hl.style.height = (r.height) + "px";
+  } else {
+    hl.style.display = "none";
+  }
+  const item = document.querySelector('.el[data-el="' + CSS.escape(id) + '"]');
+  if (item && scrollRail) item.scrollIntoView({ block: "nearest" });
+}
+
+function railItem(page, e, idx) {
+  const f = fb(page, e.id);
+  const suggest = f.verdict === "up" && !f.starred && !f.star_dismissed;
+  return '<div class="el" data-el="' + esc(e.id) + '" data-testid="gauge-element">' +
+    '<div class="row" style="justify-content:space-between">' +
+    '<b>' + (idx != null ? (idx + 1) + ". " : "") + esc(e.label) + '</b>' +
+    (e.kind ? '<span class="chip">' + esc(e.kind) + '</span>' : "") +
+    '</div>' +
+    '<div class="row" style="margin-top:6px">' +
+    '<button data-vote="up" data-el-id="' + esc(e.id) + '"' + (f.verdict === "up" ? ' class="active"' : "") + ' data-testid="gauge-verdict-up">&#128077;</button>' +
+    '<button data-vote="down" data-el-id="' + esc(e.id) + '"' + (f.verdict === "down" ? ' class="active"' : "") + ' data-testid="gauge-verdict-down">&#128078;</button>' +
+    '<button data-star="' + esc(e.id) + '"' + (f.starred ? ' class="active star"' : "") + ' title="Use as visual reference" data-testid="gauge-star">&#9733;' + (f.starred ? " starred" : "") + '</button>' +
+    (f.starred && !f.has_shot ? '<span class="chip warn">no screenshot captured</span>' : "") +
+    '</div>' +
+    (suggest ? '<div class="row" style="margin-top:4px" data-testid="gauge-star-suggest">' +
+      '<span class="chip warn">&#9733; suggested — liked elements make good references</span>' +
+      '<button data-star="' + esc(e.id) + '">Star</button>' +
+      '<button data-dismiss="' + esc(e.id) + '">Dismiss</button></div>' : "") +
+    '<textarea placeholder="Why? This comment becomes a prompt line." data-comment="' + esc(e.id) + '" data-testid="gauge-comment">' + esc(f.comment || "") + '</textarea>' +
+    '<div class="row" style="margin-top:4px">' +
+    '<button class="primary" data-save="' + esc(e.id) + '" data-testid="gauge-save-feedback">Save</button>' +
+    '</div></div>';
+}
+
+function renderRail() {
+  const page = openPage();
+  const rail = document.getElementById("rail");
+  if (!page) { rail.innerHTML = ""; return; }
+  // A vote/star save re-renders the rail when its request settles — which
+  // can land mid-typing. Carry unsaved comment drafts across the rebuild
+  // so a re-render never eats the user's text.
+  const drafts = {};
+  rail.querySelectorAll("textarea[data-comment]").forEach((t) => {
+    drafts[t.dataset.comment] = t.value;
+  });
+  const whole = { id: "_page", label: "Whole page", kind: "" };
+  rail.innerHTML = railItem(page, whole, null) +
+    (page.elements || []).map((e, i) => railItem(page, e, i)).join("");
+  rail.querySelectorAll("textarea[data-comment]").forEach((t) => {
+    const d = drafts[t.dataset.comment];
+    if (d !== undefined && d !== "" && d !== t.value) t.value = d;
+  });
+}
+
+async function openReview(id) {
+  OPEN = id;
+  const page = openPage();
+  if (!page) return;
+  document.getElementById("review-card").style.display = "";
+  document.getElementById("review-title").textContent = page.name;
+  document.getElementById("review-notes").textContent = page.design_notes || "";
+  const html = await loadHtml(id);
+  renderDoc(html);
+  renderOverlay();
+  renderPages();
+  renderRail();
+  document.getElementById("review-card").scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
+function closeReview() {
+  OPEN = null;
+  document.getElementById("review-card").style.display = "none";
+  renderPages();
+}
+
+// ── Screenshot capture (starred elements) ────────────────────────────
+// The generated page is self-contained (inline CSS, no scripts, no external
+// resources — enforced at submission), so the element can be re-rendered
+// standalone inside an SVG foreignObject and drawn to a canvas.
+
+function captureElement(pageId, elId) {
+  return new Promise((resolve, reject) => {
+    const r = elementRect(elId);
+    if (!r) return reject(new Error("element not found in the rendered page"));
+    const styles = SHADOW
+      ? Array.from(SHADOW.querySelectorAll("style")).map((s) => s.textContent).join("\n")
+      : "";
+    let xml = "";
+    try { xml = new XMLSerializer().serializeToString(r.el); }
+    catch (e) { return reject(new Error("could not serialize element: " + e.message)); }
+    const w = Math.max(1, Math.ceil(r.width));
+    const h = Math.max(1, Math.ceil(r.height));
+    const wrap = SHADOW && SHADOW.querySelector(".uig-body");
+    const bg = wrap ? getComputedStyle(wrap).backgroundColor : "#ffffff";
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '">' +
+      '<foreignObject width="100%" height="100%">' +
+      '<div xmlns="http://www.w3.org/1999/xhtml" class="uig-body" style="width:' + w + 'px;background:' + bg + '">' +
+      '<style>/*<![CDATA[*/' + styles + '/*]]>*/</style>' + xml +
+      '</div></foreignObject></svg>';
+    // A data: URL, not a blob URL — this page runs with an opaque origin
+    // (sandboxed frame), where blob loads are unreliable; data: SVGs load
+    // anywhere and keep the canvas clean.
+    const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+    const img = new Image();
+    img.onload = () => {
+      // Downscale wide elements so the base64 stays under the store cap.
+      const scale = Math.min(1, 1200 / w);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      try {
+        for (const q of [0.85, 0.65, 0.45, 0.25]) {
+          const data = canvas.toDataURL("image/jpeg", q);
+          const b64 = data.slice(data.indexOf(",") + 1);
+          if (b64.length <= 190000) {
+            return api("POST", BASE + "/shots", {
+              page_id: pageId, element_id: elId, image_base64: b64, mime_type: "image/jpeg",
+            }).then(resolve, reject);
+          }
+        }
+        reject(new Error("screenshot too large even after downscaling"));
+      } catch (e) { reject(new Error("capture failed: " + e.message)); }
+    };
+    img.onerror = () => reject(new Error("could not rasterize element"));
+    img.src = url;
+  });
+}
+
+// ── Actions ──────────────────────────────────────────────────────────
+
+async function saveFeedback(patch) {
+  const r = await api("POST", BASE + "/feedback", patch);
+  // Patch local state so open comment drafts elsewhere survive.
+  const page = STATE.pages.find((p) => p.id === patch.page_id);
+  if (page && r.feedback) {
+    page.feedback = page.feedback || {};
+    const f = r.feedback;
+    page.feedback[patch.element_id] = {
+      verdict: f.verdict, comment: f.comment, starred: f.starred,
+      star_dismissed: f.star_dismissed,
+      has_shot: (page.feedback[patch.element_id] || {}).has_shot || false,
+    };
+  }
+  // The composed prompt changed — refetch it (cheap) without re-rendering the rail.
+  try {
+    const s = await api("GET", BASE + "/state");
+    STATE.prompt = s.prompt; STATE.folders = s.folders;
+    renderPrompt();
+  } catch (_) {}
+}
 
 document.getElementById("g-btn").onclick = async () => {
   const folder_id = document.getElementById("g-folder").value;
   const model = document.getElementById("g-model").value;
+  const brief = document.getElementById("g-brief").value;
   if (!folder_id) { banner("pick a folder for the generation session"); return; }
   if (!model) { banner("pick a model"); return; }
-  try { banner(""); await api("POST", BASE + "/generate", { folder_id, model }); await refresh(); }
+  try { banner(""); await api("POST", BASE + "/generate", { folder_id, model, brief }); await refresh(); }
   catch (e) { banner(e.message); }
 };
 
-document.getElementById("cats").addEventListener("click", (ev) => {
-  const del = ev.target.closest("button[data-cat-del]");
-  if (del) { STATE.categories.splice(Number(del.dataset.catDel), 1); renderCats(); }
-});
-document.getElementById("cat-add").onclick = () => {
-  STATE.categories.push({ key: "new_category", label: "New category", bar_override: null, bar: 7 });
-  renderCats();
-};
-document.getElementById("cat-save").onclick = async () => {
-  const cats = STATE.categories.map((c, i) => ({
-    key: document.querySelector('[data-cat-key="' + i + '"]').value.trim(),
-    label: document.querySelector('[data-cat-label="' + i + '"]').value.trim(),
-    bar_override: (() => {
-      const v = document.querySelector('[data-cat-bar="' + i + '"]').value;
-      return v === "" ? null : Number(v);
-    })(),
-  }));
-  try { banner(""); await api("POST", BASE + "/categories", { categories: cats }); await refresh(); }
-  catch (e) { banner(e.message); }
-};
-
-// Downscale to ≤1200px wide JPEG so the base64 stays under the store cap.
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      const scale = Math.min(1, 1200 / img.width);
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
-      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
-      for (const q of [0.8, 0.6, 0.4, 0.25]) {
-        const data = canvas.toDataURL("image/jpeg", q);
-        const b64 = data.slice(data.indexOf(",") + 1);
-        if (b64.length <= 190000) return resolve(b64);
-      }
-      reject(new Error("screenshot too large even after downscaling"));
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("not an image")); };
-    img.src = url;
-  });
-}
-document.getElementById("b-save").onclick = async () => {
-  const file = document.getElementById("b-file").files[0];
-  if (!file) { banner("choose a screenshot first"); return; }
-  const scores = {};
-  document.querySelectorAll("#b-sliders input[type=range]").forEach((el) => {
-    scores[el.dataset.newscore] = Number(el.value);
-  });
+document.getElementById("pages").addEventListener("click", async (ev) => {
+  const open = ev.target.closest("button[data-open]");
+  const del = ev.target.closest("button[data-del]");
   try {
     banner("");
-    const image_base64 = await fileToBase64(file);
-    await api("POST", BASE + "/baselines", {
-      name: document.getElementById("b-name").value,
-      notes: document.getElementById("b-notes").value,
-      scores, image_base64, mime_type: "image/jpeg",
-    });
-    document.getElementById("b-file").value = "";
-    document.getElementById("b-name").value = "";
-    document.getElementById("b-notes").value = "";
-    await refresh();
-  } catch (e) { banner(e.message); }
-};
-document.getElementById("gallery").addEventListener("click", async (ev) => {
-  const save = ev.target.closest("button[data-base-save]");
-  const del = ev.target.closest("button[data-base-del]");
-  try {
-    banner("");
-    if (save) {
-      const id = save.dataset.baseSave;
-      const scores = {};
-      document.querySelectorAll('input[data-score-' + CSS.escape(id) + ']').forEach((el) => {
-        scores[el.getAttribute("data-score-" + id)] = Number(el.value);
-      });
-      await api("POST", BASE + "/baselines/" + id, { scores });
-      await refresh();
-    } else if (del) {
-      const id = del.dataset.baseDel;
-      if (!confirm("Delete this baseline? A deleted high-rated baseline also leaves the overall prompt.")) return;
-      await api("POST", BASE + "/baselines/" + id + "/delete");
-      delete imgCache[id]; delete htmlCache[id];
+    if (open) await openReview(open.dataset.open);
+    else if (del) {
+      if (!confirm("Delete this page? Its feedback and starred references leave the prompt too.")) return;
+      await api("POST", BASE + "/pages/" + del.dataset.del + "/delete");
+      delete htmlCache[del.dataset.del];
+      if (OPEN === del.dataset.del) closeReview();
       await refresh();
     }
   } catch (e) { banner(e.message); }
 });
 
+document.getElementById("review-close").onclick = closeReview;
+
+document.getElementById("rail").addEventListener("click", async (ev) => {
+  const page = openPage();
+  if (!page) return;
+  const vote = ev.target.closest("button[data-vote]");
+  const star = ev.target.closest("button[data-star]");
+  const dismiss = ev.target.closest("button[data-dismiss]");
+  const save = ev.target.closest("button[data-save]");
+  const item = ev.target.closest(".el");
+  try {
+    banner("");
+    if (vote) {
+      const id = vote.dataset.elId;
+      const cur = fb(page, id).verdict;
+      const next = cur === vote.dataset.vote ? "" : vote.dataset.vote;
+      await saveFeedback({ page_id: page.id, element_id: id, verdict: next });
+      renderRail(); renderOverlay(); selectElement(id, false);
+    } else if (star) {
+      const id = star.dataset.star;
+      const starred = !fb(page, id).starred;
+      if (starred && id !== "_page") {
+        try {
+          await captureElement(page.id, id);
+          page.feedback = page.feedback || {};
+          (page.feedback[id] = page.feedback[id] || {}).has_shot = true;
+        } catch (e) { banner("starred without screenshot: " + e.message); }
+      }
+      await saveFeedback({ page_id: page.id, element_id: id, starred });
+      renderRail(); renderOverlay();
+    } else if (dismiss) {
+      await saveFeedback({ page_id: page.id, element_id: dismiss.dataset.dismiss, star_dismissed: true });
+      renderRail();
+    } else if (save) {
+      const id = save.dataset.save;
+      const ta = document.querySelector('textarea[data-comment="' + CSS.escape(id) + '"]');
+      await saveFeedback({ page_id: page.id, element_id: id, comment: ta ? ta.value : "" });
+      renderRail(); renderOverlay(); renderPages();
+    } else if (item) {
+      selectElement(item.dataset.el, false);
+    }
+  } catch (e) { banner(e.message); }
+});
+
+document.getElementById("folders").addEventListener("change", async (ev) => {
+  const box = ev.target.closest("input[data-folder]");
+  if (!box) return;
+  try {
+    banner("");
+    await api("POST", BASE + "/folders", { folder_id: box.dataset.folder, enabled: box.checked });
+    const f = STATE.folders.find((x) => x.id === box.dataset.folder);
+    if (f) f.enabled = box.checked;
+    renderPrompt();
+  } catch (e) { banner(e.message); }
+});
+
+document.getElementById("copy-prompt").onclick = () => {
+  const text = STATE.prompt.text || "";
+  const done = () => {
+    const chip = document.getElementById("copy-done");
+    chip.style.display = "";
+    setTimeout(() => { chip.style.display = "none"; }, 1500);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+  } else fallbackCopy(text, done);
+};
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(); } catch (_) {}
+  ta.remove();
+}
+
+function render() { renderGenerate(); renderPrompt(); renderPages(); if (OPEN) renderRail(); }
+
 async function refresh() {
   try {
+    const keep = OPEN;
     STATE = await api("GET", BASE + "/state");
+    if (keep && !STATE.pages.some((p) => p.id === keep)) closeReview();
     document.getElementById("stale").style.display = "none";
     render();
+    if (OPEN) renderOverlay();
   }
   catch (e) { banner(e.message); }
 }
 document.getElementById("refresh-btn").onclick = refresh;
-// NO automatic refresh, ever: a re-render wipes in-progress slider
-// ratings, so the page must never reload state except on explicit user
+// NO automatic refresh, ever: a re-render wipes in-progress comment
+// drafts, so the page must never reload state except on explicit user
 // action. The WebSocket below (ticket-authed via the parent frame; the
 // JWT never enters this sandbox) only lights the "data changed" chip —
 // the user presses Refresh when ready. "locks" is the cross-instance
@@ -795,7 +1070,7 @@ async function boot() {
   connectEvents();
   // Retry while empty so a slow or failed first fetch never leaves the
   // generation dropdowns permanently blank. Only rewrites the two
-  // dropdowns (never the rating sliders) and stops once populated.
+  // dropdowns (never in-progress feedback) and stops once populated.
   const pickerTimer = setInterval(async () => {
     if (PICKERS.folders.length && PICKERS.models.length) { clearInterval(pickerTimer); return; }
     try { await loadPickers(); renderGenerate(); } catch (_) {}
@@ -812,32 +1087,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn page_html_has_bridge_generation_and_testids() {
+    fn page_html_has_bridge_review_and_testids() {
         assert!(PAGE_HTML.contains("plugin-ui-fetch"));
         // Change notifications ride the page's own ticket-authed WebSocket,
         // but they must NEVER auto-refresh the page — a re-render wipes
-        // in-progress slider ratings. Events only light the stale chip; the
+        // in-progress comment drafts. Events only light the stale chip; the
         // user reloads via the Refresh button.
         assert!(PAGE_HTML.contains("plugin-ui-ws-ticket"));
         assert!(PAGE_HTML.contains("/ws/plugin-ui?ticket="));
         assert!(!PAGE_HTML.contains("setInterval(refresh"));
         assert!(!PAGE_HTML.contains("scheduleRefresh"));
-        assert!(PAGE_HTML.contains("data-testid=\"gauge-refresh\""));
-        assert!(PAGE_HTML.contains("data-testid=\"gauge-stale\""));
-        assert!(PAGE_HTML.contains("data-testid=\"gauge-baseline\""));
-        assert!(PAGE_HTML.contains("data-testid=\"gauge-eval\""));
-        assert!(PAGE_HTML.contains("data-testid=\"gauge-generate\""));
-        assert!(PAGE_HTML.contains("data-testid=\"gauge-overall\""));
-        assert!(PAGE_HTML.contains("data-testid=\"gauge-gen-status\""));
-        // Generated previews must never execute scripts.
-        assert!(PAGE_HTML.contains("iframe sandbox=\"\""));
+        for id in [
+            "gauge-refresh",
+            "gauge-stale",
+            "gauge-generate",
+            "gauge-gen-status",
+            "gauge-gen-brief",
+            "gauge-page",
+            "gauge-open-review",
+            "gauge-review",
+            "gauge-element",
+            "gauge-verdict-up",
+            "gauge-verdict-down",
+            "gauge-comment",
+            "gauge-save-feedback",
+            "gauge-star",
+            "gauge-prompt",
+            "gauge-ingredients",
+            "gauge-folder-toggle",
+            "gauge-copy-prompt",
+        ] {
+            assert!(
+                PAGE_HTML.contains(&format!("data-testid=\"{id}\"")),
+                "missing testid {id}"
+            );
+        }
+        // Pins are DOM-created; their testid rides setAttribute.
+        assert!(PAGE_HTML.contains("setAttribute(\"data-testid\", \"gauge-pin\")"));
+        // Generated markup renders in a sanitized shadow root — parsed
+        // inert, scripts and on*/javascript: stripped — never in an iframe
+        // (the sandboxed plugin frame makes any nested frame cross-origin).
+        assert!(PAGE_HTML.contains("sanitizeGeneratedHtml"));
+        assert!(PAGE_HTML.contains("DOMParser"));
+        assert!(PAGE_HTML.contains("attachShadow"));
+        assert!(!PAGE_HTML.contains("review-frame"));
+        assert!(!PAGE_HTML.contains("srcdoc"));
         assert!(PAGE_HTML.contains("/api/plugin-ui/ui-gauge"));
-    }
-
-    #[test]
-    fn parse_scores_filters_out_of_range() {
-        let s = parse_scores(Some(&json!({ "a": 5, "b": 0, "c": 11, "d": "x" })));
-        assert_eq!(s.len(), 1);
-        assert_eq!(s.get("a"), Some(&5u8));
     }
 }

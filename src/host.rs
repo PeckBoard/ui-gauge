@@ -8,16 +8,19 @@ pub enum HostFn {
     StoreList,
     StoreDelete,
     /// Atomic put-if-absent — the cross-instance lease behind
-    /// `gauge::try_with_store_lock` (0.2.2, needs peckboard ≥ 0.0.189).
+    /// `gauge::try_with_store_lock` (needs peckboard ≥ 0.0.189).
     StorePutIfAbsent,
     CallerScope,
-    CreateCard,
-    // Baseline generation (0.2.0): spawn + drive a temp generation session,
-    // and fill the folder/model pickers.
+    // Page generation: spawn + drive a temp generation session, and fill
+    // the folder/model pickers.
     CreateSession,
     DispatchCapture,
     ListFolders,
     ListModels,
+    /// Attach/remove the folder's UI preference block on a session
+    /// (`session_prompt_write` permission; core reads `session.system_prompt`
+    /// at every dispatch).
+    SetSessionSystemPrompt,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -33,11 +36,11 @@ mod imp {
         fn peckboard_store_delete(input: String) -> String;
         fn peckboard_store_put_if_absent(input: String) -> String;
         fn peckboard_caller_scope(input: String) -> String;
-        fn peckboard_create_card(input: String) -> String;
         fn peckboard_create_session(input: String) -> String;
         fn peckboard_dispatch_capture(input: String) -> String;
         fn peckboard_list_folders(input: String) -> String;
         fn peckboard_list_models(input: String) -> String;
+        fn peckboard_set_session_system_prompt(input: String) -> String;
     }
 
     pub fn call_host(
@@ -53,11 +56,11 @@ mod imp {
                 HostFn::StoreDelete => peckboard_store_delete(s),
                 HostFn::StorePutIfAbsent => peckboard_store_put_if_absent(s),
                 HostFn::CallerScope => peckboard_caller_scope(s),
-                HostFn::CreateCard => peckboard_create_card(s),
                 HostFn::CreateSession => peckboard_create_session(s),
                 HostFn::DispatchCapture => peckboard_dispatch_capture(s),
                 HostFn::ListFolders => peckboard_list_folders(s),
                 HostFn::ListModels => peckboard_list_models(s),
+                HostFn::SetSessionSystemPrompt => peckboard_set_session_system_prompt(s),
             }
         }
         .map_err(|e| e.to_string())?;

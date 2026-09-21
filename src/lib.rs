@@ -1,14 +1,14 @@
 //! Peckboard ui-gauge plugin (WASM / Extism).
 //!
-//! Gauges UI design quality against **user-ranked baselines**: the user
-//! uploads reference screenshots on the UI Gauge page and ranks each 1-10
-//! per category (visual hierarchy, spacing, typography, color/contrast,
-//! consistency, accessibility — editable). A vision-capable agent then
-//! scores worker output on that same calibrated scale
-//! (`ui_gauge_rubric` → `ui_gauge_baseline_image` → `ui_gauge_score`); a
-//! category below its bar makes the verdict subpar and auto-creates one
-//! follow-up card per gap. The plugin owns the rubric, calibration,
-//! verdicts, history, and cards — never the pixels.
+//! Steers UI-generating agents toward the user's taste with a
+//! **generate → review → learn → attach** loop: the user initiates
+//! generation of a marked-up HTML page in a temp agent session; every
+//! generated element carries `data-uig-id` / `data-uig-label` and gets
+//! individual feedback (👍/👎, comment, star) on the UI Gauge page —
+//! document-review style. Feedback composes into a per-folder **UI
+//! preference prompt** the user can toggle onto every chat session in that
+//! folder, and starred elements' screenshots are fetchable by agents as
+//! visual references (`ui_gauge_reference_image`).
 //!
 //! ## Plugin interface
 //!
@@ -21,6 +21,7 @@ mod gauge;
 mod host;
 mod manifest;
 mod page;
+mod prompt_sync;
 mod tools;
 
 use serde::Deserialize;
@@ -64,13 +65,20 @@ fn dispatch_hook(hook: &str, payload: serde_json::Value) -> String {
     match hook {
         "mcp.tool.invoke" => handle_invoke(payload),
         "timer.tick" => {
-            // Clock only — evaluations are stamped with the last tick.
+            // Clock + the one-time 0.2.x collection sweep.
             if let Some(now) = payload.get("now").and_then(|v| v.as_str()) {
                 gauge::set_clock(now);
             }
+            gauge::sweep_legacy_collections();
             skip()
         }
-        // A generation session that ends without ever submitting a baseline
+        // Sync the session's UI-taste block with its folder's toggle, then
+        // stay out of the turn — never rewrite the message.
+        "session.message.before" => {
+            prompt_sync::sync(&payload);
+            skip()
+        }
+        // A generation session that ends without ever submitting a page
         // flips the pending generation to "ended" so the page can say so
         // (a successful submit already set it to "done").
         "session.agent.ended" => {
@@ -115,18 +123,14 @@ fn handle_invoke(payload: serde_json::Value) -> String {
         .unwrap_or(serde_json::Value::Null);
 
     let result: Result<serde_json::Value, String> = match tool.as_str() {
-        "ui_gauge_rubric" => tools::rubric_tool(args),
-        "ui_gauge_baseline_image" => tools::baseline_image_tool(args),
-        // The two writing tools hold the cross-instance store lease so their
+        // The writing tool holds the cross-instance store lease so its
         // read→modify→write stays atomic when calls run on several wasm
         // instances (manifest `concurrency` > 1).
-        "ui_gauge_score" => gauge::try_with_store_lock(|| tools::score_tool(args))
+        "ui_gauge_submit_page" => gauge::try_with_store_lock(|| tools::submit_page_tool(args))
             .and_then(|r| r.ok_or_else(|| gauge::BUSY_MSG.to_string())),
+        "ui_gauge_prefs" => tools::prefs_tool(args),
+        "ui_gauge_reference_image" => tools::reference_image_tool(args),
         "ui_gauge_history" => tools::history_tool(args),
-        "ui_gauge_submit_baseline" => {
-            gauge::try_with_store_lock(|| tools::submit_baseline_tool(args))
-                .and_then(|r| r.ok_or_else(|| gauge::BUSY_MSG.to_string()))
-        }
         other => return cancel(&format!("ui-gauge does not provide tool '{other}'")),
     };
 

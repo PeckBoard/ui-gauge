@@ -1,91 +1,89 @@
-//! UI-gauge domain logic: categories, user-ranked baselines, the per-category
-//! bar (median of the user's rankings unless overridden), verdicts, and the
-//! evaluation history.
+//! UI-gauge domain logic (0.3.0): generated pages with marked elements,
+//! per-element user feedback, the per-folder UI preference prompt composed
+//! from that feedback, and starred-element screenshots agents can fetch as
+//! visual references.
 //!
-//! The plugin is the rubric store, calibrator, verdict engine, and card
-//! creator. It never looks at pixels — a vision-capable agent session does
-//! the scoring, anchored to the user's own baseline rankings via
-//! `ui_gauge_rubric` / `ui_gauge_baseline_image`.
+//! The plugin never looks at pixels — generation happens in a temp agent
+//! session, screenshots are captured client-side on the UI Gauge page, and
+//! the composed preference prompt is what steers future UI work.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::host::{HostFn, call_host};
 
-pub const CATEGORIES_COLLECTION: &str = "categories";
-pub const BASELINES_COLLECTION: &str = "baselines";
-pub const BASELINE_IMAGES_COLLECTION: &str = "baseline_images";
-pub const EVALUATIONS_COLLECTION: &str = "evaluations";
-/// Generated baselines' full HTML documents, keyed by baseline id.
-pub const BASELINE_HTML_COLLECTION: &str = "baseline_html";
+/// Generated pages' metadata (element manifest included), keyed by page id.
+pub const PAGES_COLLECTION: &str = "pages";
+/// Generated pages' full HTML documents, keyed by page id — kept out of the
+/// page record so listing pages never drags the documents along.
+pub const PAGE_HTML_COLLECTION: &str = "page_html";
+/// Per-element feedback, keyed `"<page_id>:<element_id>"`.
+pub const FEEDBACK_COLLECTION: &str = "feedback";
+/// Starred-element screenshots (base64), keyed `"<page_id>:<element_id>"`.
+pub const SHOTS_COLLECTION: &str = "shots";
+/// Per-folder prompt toggle, keyed by folder id.
+pub const FOLDER_PREFS_COLLECTION: &str = "folder_prefs";
+/// session id → hash of the preference block last written to that session.
+pub const SESSION_PROMPT_COLLECTION: &str = "session_prompt";
 pub const ENGINE_COLLECTION: &str = "engine";
 
-pub const EVALUATIONS_CAP: usize = 100;
-pub const DEFAULT_BAR: u8 = 7;
+/// Generated HTML cap — stays under the 256 KB store-document ceiling.
+pub const HTML_MAX_LEN: usize = 180_000;
+pub const MAX_ELEMENTS: usize = 40;
+pub const PAGES_CAP: usize = 40;
+/// Element id for page-level (whole page) feedback.
+pub const PAGE_ELEMENT_ID: &str = "_page";
+
+// ── Model ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Category {
-    pub key: String,
+pub struct PageElement {
+    pub id: String,
     pub label: String,
-    /// User override; None = median of baseline rankings, else DEFAULT_BAR.
+    /// Optional coarse kind ("header", "card", "form", …) — display only.
     #[serde(default)]
-    pub bar_override: Option<u8>,
-}
-
-pub fn default_categories() -> Vec<Category> {
-    [
-        ("visual_hierarchy", "Visual hierarchy"),
-        ("spacing_alignment", "Spacing & alignment"),
-        ("typography", "Typography"),
-        ("color_contrast", "Color & contrast"),
-        ("consistency", "Consistency with the app"),
-        ("accessibility", "Accessibility"),
-    ]
-    .into_iter()
-    .map(|(key, label)| Category {
-        key: key.to_string(),
-        label: label.to_string(),
-        bar_override: None,
-    })
-    .collect()
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Baseline {
+pub struct Page {
     pub id: String,
     pub name: String,
+    /// The user's brief this page was generated from ("" = agent's pick).
     #[serde(default)]
-    pub notes: String,
-    /// category key → the USER's 1-10 ranking of this reference.
+    pub brief: String,
     #[serde(default)]
-    pub scores: std::collections::BTreeMap<String, u8>,
+    pub model: String,
+    /// The generating agent's notes on what it tried.
     #[serde(default)]
-    pub mime_type: String,
+    pub design_notes: String,
     #[serde(default)]
     pub created_at: String,
-    /// "image" (user-uploaded screenshot) or "generated" (agent-produced
-    /// HTML, stored in `baseline_html/<id>`). Default keeps 0.1.0 data valid.
-    #[serde(default = "default_kind")]
-    pub kind: String,
-    /// Generated baselines: what this iteration changed vs the previous ones
-    /// — the directive that graduates into the overall prompt when the user
-    /// rates the result high.
     #[serde(default)]
-    pub change_prompt: String,
+    pub elements: Vec<PageElement>,
 }
 
-fn default_kind() -> String {
-    "image".into()
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Feedback {
+    pub page_id: String,
+    pub element_id: String,
+    /// "up", "down", or "" (no verdict yet).
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub comment: String,
+    /// Starred = use as a visual reference (screenshot attached).
+    #[serde(default)]
+    pub starred: bool,
+    /// User dismissed the auto-star suggestion for this element.
+    #[serde(default)]
+    pub star_dismissed: bool,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
-impl Baseline {
-    /// Mean of the user's category rankings; None while unrated.
-    pub fn avg_score(&self) -> Option<f64> {
-        if self.scores.is_empty() {
-            return None;
-        }
-        Some(self.scores.values().map(|s| *s as f64).sum::<f64>() / self.scores.len() as f64)
-    }
+pub fn feedback_key(page_id: &str, element_id: &str) -> String {
+    format!("{page_id}:{element_id}")
 }
 
 // ── Store access (same envelope as the other Rust plugins) ────────────
@@ -142,17 +140,15 @@ pub fn store_delete(collection: &str, key: &str) {
 /// 0.0.189). `Ok(None)` = contended — surface "busy" to the caller. `f`
 /// must LOAD what it mutates inside the closure.
 #[cfg(target_arch = "wasm32")]
-pub fn try_with_store_lock<T>(
-    f: impl FnOnce() -> Result<T, String>,
-) -> Result<Option<T>, String> {
+pub fn try_with_store_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<Option<T>, String> {
     let acquired = call_host(
         HostFn::StorePutIfAbsent,
         &json!({
             "collection": "locks",
             "key": "store",
             "data": { "at": clock() },
-            // Above the 30s call budget generate/judge calls can use, so a
-            // live holder is never stolen; a trapped one leaks ≤ 60s.
+            // Above the 30s call budget generate calls can use, so a live
+            // holder is never stolen; a trapped one leaks ≤ 60s.
             "ttl_secs": 60,
         }),
     )?
@@ -169,9 +165,7 @@ pub fn try_with_store_lock<T>(
 
 /// Host builds (unit tests) are single-threaded pure logic — no lease.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn try_with_store_lock<T>(
-    f: impl FnOnce() -> Result<T, String>,
-) -> Result<Option<T>, String> {
+pub fn try_with_store_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<Option<T>, String> {
     f().map(Some)
 }
 
@@ -191,135 +185,6 @@ pub fn clock() -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
 }
 
-// ── Categories + bars ─────────────────────────────────────────────────
-
-pub fn categories() -> Vec<Category> {
-    store_get(CATEGORIES_COLLECTION, "all")
-        .ok()
-        .flatten()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_else(default_categories)
-}
-
-pub fn save_categories(cats: &[Category]) -> Result<(), String> {
-    store_put(
-        CATEGORIES_COLLECTION,
-        "all",
-        serde_json::to_value(cats).map_err(|e| e.to_string())?,
-    )
-}
-
-pub fn baselines() -> Vec<Baseline> {
-    let mut out: Vec<Baseline> = store_list(BASELINES_COLLECTION)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(_, v)| serde_json::from_value(v).ok())
-        .collect();
-    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    out
-}
-
-/// The bar for one category: user override, else the median of the user's
-/// baseline rankings for it, else [`DEFAULT_BAR`]. Pure — testable.
-pub fn bar_for(cat: &Category, baselines: &[Baseline]) -> u8 {
-    if let Some(b) = cat.bar_override {
-        return b.clamp(1, 10);
-    }
-    let mut scores: Vec<u8> = baselines
-        .iter()
-        .filter_map(|b| b.scores.get(&cat.key).copied())
-        .collect();
-    if scores.is_empty() {
-        return DEFAULT_BAR;
-    }
-    scores.sort_unstable();
-    // Lower median for even counts: the stricter of the two middles would
-    // punish a user whose baselines straddle the bar; the looser one is the
-    // honest "half my references are at least this good".
-    scores[(scores.len() - 1) / 2]
-}
-
-// ── Verdicts ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Gap {
-    pub category: String,
-    pub label: String,
-    pub score: u8,
-    pub bar: u8,
-}
-
-/// Compare submitted scores against the bars. Unknown categories are
-/// rejected; missing categories are gaps at score 0 (unscored ≠ passed).
-pub fn judge(
-    scores: &std::collections::BTreeMap<String, u8>,
-    cats: &[Category],
-    baselines: &[Baseline],
-) -> Result<Vec<Gap>, String> {
-    for key in scores.keys() {
-        if !cats.iter().any(|c| &c.key == key) {
-            return Err(format!(
-                "unknown category '{key}' — call ui_gauge_rubric for the current category keys"
-            ));
-        }
-    }
-    let mut gaps = Vec::new();
-    for cat in cats {
-        let bar = bar_for(cat, baselines);
-        let score = scores.get(&cat.key).copied().unwrap_or(0);
-        if score < bar {
-            gaps.push(Gap {
-                category: cat.key.clone(),
-                label: cat.label.clone(),
-                score,
-                bar,
-            });
-        }
-    }
-    Ok(gaps)
-}
-
-// ── Evaluation history ────────────────────────────────────────────────
-
-pub fn record_evaluation(eval: Value) -> Result<(), String> {
-    let id = eval
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or("evaluation missing id")?
-        .to_string();
-    store_put(EVALUATIONS_COLLECTION, &id, eval)?;
-    // Prune beyond the cap, oldest first (keys sort by ts prefix).
-    let mut keys: Vec<String> = store_list(EVALUATIONS_COLLECTION)?
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
-    if keys.len() > EVALUATIONS_CAP {
-        keys.sort();
-        for k in keys.iter().take(keys.len() - EVALUATIONS_CAP) {
-            store_delete(EVALUATIONS_COLLECTION, k);
-        }
-    }
-    Ok(())
-}
-
-pub fn evaluations(target: Option<&str>) -> Vec<Value> {
-    let mut evals: Vec<Value> = store_list(EVALUATIONS_COLLECTION)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, v)| v)
-        .filter(|v| match target {
-            Some(t) => v.get("target").and_then(|x| x.as_str()) == Some(t),
-            None => true,
-        })
-        .collect();
-    evals.sort_by(|a, b| {
-        let ta = a.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        let tb = b.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        tb.cmp(ta) // newest first
-    });
-    evals
-}
-
 /// Monotonic-enough id: clock second + atomic counter (sorts by time).
 pub fn new_id(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -329,104 +194,309 @@ pub fn new_id(prefix: &str) -> String {
     format!("{prefix}-{compact}-{n:04}")
 }
 
-// ── Overall baseline prompt + the generation loop (0.2.0) ──────────
+// ── Loading ───────────────────────────────────────────────────────────
 
-/// A generated baseline whose average user rating clears this graduates its
-/// `change_prompt` into the overall prompt.
-pub const HIGH_AVG: f64 = 7.0;
-/// At or below this, the change is listed as something to avoid when
-/// generating the next iteration.
-pub const LOW_AVG: f64 = 4.0;
-/// Generated HTML cap — stays under the 256 KB store-document ceiling.
-pub const HTML_MAX_LEN: usize = 180_000;
-
-/// The living "overall baseline prompt": the style directives the user has
-/// validated, assembled from every high-rated generated baseline's
-/// `change_prompt` (oldest → newest, so later refinements read last). Pure
-/// and computed on read — it can never go stale: re-rating or deleting a
-/// baseline changes the very next read.
-pub fn overall_prompt(baselines: &[Baseline]) -> String {
-    let mut proven: Vec<String> = Vec::new();
-    for b in baselines {
-        if b.kind != "generated" || b.change_prompt.trim().is_empty() {
-            continue;
-        }
-        if let Some(avg) = b.avg_score()
-            && avg >= HIGH_AVG
-        {
-            proven.push(format!("- [rated {avg:.1}/10] {}", b.change_prompt.trim()));
-        }
-    }
-    let mut out = String::from(
-        "# Overall UI baseline prompt\n\
-         Style directives the user has validated by rating generated baselines \
-         7+/10. Apply ALL of them when designing or judging UI for this user.\n",
-    );
-    if proven.is_empty() {
-        out.push_str("\n(No validated directives yet — generate baselines and rate them.)\n");
-    } else {
-        out.push('\n');
-        out.push_str(&proven.join("\n"));
-        out.push('\n');
-    }
+pub fn pages() -> Vec<Page> {
+    let mut out: Vec<Page> = store_list(PAGES_COLLECTION)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_value(v).ok())
+        .collect();
+    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     out
 }
 
-/// The prompt handed to a generation session: the validated overall prompt,
-/// what to improve on, what to avoid, and the submission contract.
-pub fn build_generation_prompt(baselines: &[Baseline]) -> String {
-    let generated: Vec<&Baseline> = baselines.iter().filter(|b| b.kind == "generated").collect();
-    let mut keep = Vec::new();
-    let mut avoid = Vec::new();
-    let mut unrated = 0usize;
-    for b in generated.iter().rev().take(10) {
-        match b.avg_score() {
-            Some(avg) if avg >= HIGH_AVG => {
-                keep.push(format!("- [{avg:.1}/10] {}", b.change_prompt.trim()))
-            }
-            Some(avg) if avg <= LOW_AVG => {
-                avoid.push(format!("- [{avg:.1}/10] {}", b.change_prompt.trim()))
-            }
-            Some(_) => {}
-            None => unrated += 1,
+pub fn all_feedback() -> Vec<Feedback> {
+    store_list(FEEDBACK_COLLECTION)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_value(v).ok())
+        .collect()
+}
+
+pub fn delete_page(id: &str) {
+    store_delete(PAGES_COLLECTION, id);
+    store_delete(PAGE_HTML_COLLECTION, id);
+    let prefix = format!("{id}:");
+    for (k, _) in store_list(FEEDBACK_COLLECTION).unwrap_or_default() {
+        if k.starts_with(&prefix) {
+            store_delete(FEEDBACK_COLLECTION, &k);
         }
     }
-    let mut p = String::from(
-        "Generate ONE self-contained baseline UI page: a realistic, polished dashboard-style \
-         screen (invent plausible content) as a single HTML document with ALL CSS inlined in a \
-         <style> tag. No external resources, no JavaScript — it is rendered statically in a \
-         sandboxed frame for the user to rate 1-10 per design category.\n\n",
-    );
-    p.push_str(&overall_prompt(baselines));
-    if !avoid.is_empty() {
-        p.push_str("\n## The user rated these changes LOW — avoid repeating them\n");
-        p.push_str(&avoid.join("\n"));
-        p.push('\n');
+    for (k, _) in store_list(SHOTS_COLLECTION).unwrap_or_default() {
+        if k.starts_with(&prefix) {
+            store_delete(SHOTS_COLLECTION, &k);
+        }
     }
-    if unrated > 0 {
-        p.push_str(&format!(
-            "\n({unrated} earlier generated baseline(s) are still unrated — vary a different \
-             aspect rather than re-testing the same idea.)\n"
+}
+
+// ── Submission validation ─────────────────────────────────────────────
+
+fn valid_element_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id != PAGE_ELEMENT_ID
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// Validate a generated page submission. Pure — testable.
+pub fn validate_submission(html: &str, elements: &[PageElement]) -> Result<(), String> {
+    if html.len() > HTML_MAX_LEN {
+        return Err(format!(
+            "html too large ({} chars, max {HTML_MAX_LEN}) — trim the page and resubmit",
+            html.len()
         ));
     }
-    let _ = keep; // already embedded via overall_prompt
-    p.push_str(
-        "\n## Your task\n\
-         1. Improve on the previous baselines: keep every validated directive above, then \
-         change or refine ONE clear aspect (layout rhythm, type scale, color system, density, \
-         component styling, …) that could raise the user's ratings.\n\
-         2. Submit EXACTLY ONE result by calling the ui_gauge_submit_baseline tool with:\n\
-         - html: the complete HTML document (≤ 180000 chars)\n\
-         - change_summary: one short paragraph of WHAT you changed vs the previous baselines \
-         and why — written as a reusable style directive (it becomes part of the overall \
-         prompt if the user rates it high)\n\
-         - name: a short title for this iteration\n\
-         Do not ask questions; do not produce anything else.",
+    let lower = html.to_lowercase();
+    if !lower.contains("<html") && !lower.contains("<body") {
+        return Err("html must be a complete self-contained HTML document".into());
+    }
+    if lower.contains("<script") {
+        return Err("no JavaScript allowed — the page is rendered in a script-less frame".into());
+    }
+    if elements.is_empty() {
+        return Err("'elements' must list every marked element (at least one)".into());
+    }
+    if elements.len() > MAX_ELEMENTS {
+        return Err(format!(
+            "too many elements ({}, max {MAX_ELEMENTS}) — mark the meaningful regions, not every node",
+            elements.len()
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for el in elements {
+        if !valid_element_id(&el.id) {
+            return Err(format!(
+                "element id '{}' must be 1-64 chars of [a-z0-9-_] (and not '{PAGE_ELEMENT_ID}')",
+                el.id
+            ));
+        }
+        if !seen.insert(el.id.clone()) {
+            return Err(format!("duplicate element id '{}'", el.id));
+        }
+        if el.label.trim().is_empty() {
+            return Err(format!("element '{}' is missing a label", el.id));
+        }
+        if !html.contains(&format!("data-uig-id=\"{}\"", el.id)) {
+            return Err(format!(
+                "element '{}' is listed but data-uig-id=\"{}\" does not appear in the html",
+                el.id, el.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ── The preference prompt ─────────────────────────────────────────────
+
+/// One line of the composed prompt plus where it came from — the UI shows
+/// the ingredient list so the user can see exactly what feeds the prompt.
+#[derive(Debug, Clone, Serialize)]
+pub struct Ingredient {
+    pub line: String,
+    pub section: String, // "do" | "avoid" | "reference"
+    pub page_id: String,
+    pub page_name: String,
+    pub element_id: String,
+    pub element_label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrefPrompt {
+    pub text: String,
+    pub ingredients: Vec<Ingredient>,
+}
+
+fn clip(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    let cut: String = t.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+fn element_label<'a>(page: &'a Page, element_id: &str) -> Option<&'a str> {
+    if element_id == PAGE_ELEMENT_ID {
+        return Some("whole page");
+    }
+    page.elements
+        .iter()
+        .find(|e| e.id == element_id)
+        .map(|e| e.label.as_str())
+}
+
+/// Compose the user's UI preference prompt from every piece of feedback.
+/// Pure and computed on read — re-editing or deleting feedback changes the
+/// very next read, so it can never go stale. `shot_keys` is the set of
+/// feedback keys that actually have a stored screenshot (a star without a
+/// captured shot contributes a Do-line but no reference).
+pub fn preference_prompt(
+    pages: &[Page],
+    feedback: &[Feedback],
+    shot_keys: &std::collections::BTreeSet<String>,
+) -> PrefPrompt {
+    let mut dos: Vec<Ingredient> = Vec::new();
+    let mut avoids: Vec<Ingredient> = Vec::new();
+    let mut refs: Vec<Ingredient> = Vec::new();
+
+    for page in pages {
+        for fb in feedback.iter().filter(|f| f.page_id == page.id) {
+            let Some(label) = element_label(page, &fb.element_id) else {
+                continue; // stale feedback for a removed element
+            };
+            let comment = clip(&fb.comment, 300);
+            let make = |line: String, section: &str| Ingredient {
+                line,
+                section: section.into(),
+                page_id: page.id.clone(),
+                page_name: page.name.clone(),
+                element_id: fb.element_id.clone(),
+                element_label: label.to_string(),
+            };
+            match fb.verdict.as_str() {
+                "up" => {
+                    let line = if comment.is_empty() {
+                        format!("- {label} (from \"{}\"): liked as generated.", page.name)
+                    } else {
+                        format!("- {label} (from \"{}\"): {comment}", page.name)
+                    };
+                    dos.push(make(line, "do"));
+                }
+                "down" => {
+                    let line = if comment.is_empty() {
+                        format!("- {label} (from \"{}\"): disliked as generated.", page.name)
+                    } else {
+                        format!("- {label} (from \"{}\"): {comment}", page.name)
+                    };
+                    avoids.push(make(line, "avoid"));
+                }
+                _ => {
+                    // No verdict — a bare comment still carries signal.
+                    if !comment.is_empty() {
+                        let line = format!("- {label} (from \"{}\"): {comment}", page.name);
+                        dos.push(make(line, "do"));
+                    }
+                }
+            }
+            if fb.starred && shot_keys.contains(&feedback_key(&fb.page_id, &fb.element_id)) {
+                let id = feedback_key(&fb.page_id, &fb.element_id);
+                let line = format!("- id \"{id}\" — {label} (from \"{}\")", page.name);
+                refs.push(make(line, "reference"));
+            }
+        }
+    }
+
+    let mut text = String::from(
+        "## UI taste (ui-gauge)\nThe user has reviewed generated UI and recorded these \
+         preferences. Apply them whenever you build, modify, or judge user interface for \
+         this user.\n",
     );
+    if dos.is_empty() && avoids.is_empty() && refs.is_empty() {
+        text.push_str("\n(No recorded preferences yet.)\n");
+    }
+    if !dos.is_empty() {
+        text.push_str("\n### Do\n");
+        for i in &dos {
+            text.push_str(&i.line);
+            text.push('\n');
+        }
+    }
+    if !avoids.is_empty() {
+        text.push_str("\n### Avoid\n");
+        for i in &avoids {
+            text.push_str(&i.line);
+            text.push('\n');
+        }
+    }
+    if !refs.is_empty() {
+        text.push_str(
+            "\n### Visual references\nBefore designing similar UI, fetch these screenshots \
+             of elements the user starred with the ui_gauge_reference_image tool:\n",
+        );
+        for i in &refs {
+            text.push_str(&i.line);
+            text.push('\n');
+        }
+    }
+
+    let mut ingredients = dos;
+    ingredients.extend(avoids);
+    ingredients.extend(refs);
+    PrefPrompt { text, ingredients }
+}
+
+/// The block injected into sessions of an enabled folder. None when there is
+/// nothing to say yet — an empty taste block would be pure noise.
+pub fn session_block(pref: &PrefPrompt) -> Option<String> {
+    if pref.ingredients.is_empty() {
+        return None;
+    }
+    Some(pref.text.clone())
+}
+
+// ── The generation prompt ─────────────────────────────────────────────
+
+/// The prompt handed to a generation session: the user's accumulated taste,
+/// what earlier pages covered, the brief (or free choice), and the
+/// submission contract with element marking.
+pub fn build_generation_prompt(brief: &str, pages: &[Page], feedback: &[Feedback]) -> String {
+    let pref = preference_prompt(pages, feedback, &Default::default());
+    let mut p = String::from(
+        "Design ONE self-contained UI page as a single HTML document with ALL CSS inlined \
+         in a <style> tag. No external resources, no JavaScript — it is rendered statically \
+         in a script-less frame where the user reviews it element by element.\n\n",
+    );
+    let brief = brief.trim();
+    if brief.is_empty() {
+        p.push_str(
+            "## The page\nNo brief was given — pick ONE realistic, representative screen \
+             yourself (dashboard, settings, list + detail, form, onboarding, …) and invent \
+             plausible content. Prefer a page type the previous pages below have not covered.\n\n",
+        );
+    } else {
+        p.push_str(&format!(
+            "## The page\nThe user asked for: {brief}\nInvent plausible content around that.\n\n"
+        ));
+    }
+    p.push_str(&pref.text);
+    if !pages.is_empty() {
+        p.push_str("\n## Previously generated pages\n");
+        for pg in pages.iter().rev().take(10) {
+            let brief_note = if pg.brief.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" (brief: {})", clip(&pg.brief, 80))
+            };
+            p.push_str(&format!("- {}{brief_note}\n", pg.name));
+        }
+        p.push_str(
+            "Explore ground these have not covered rather than repeating them, while \
+             keeping every Do-preference above.\n",
+        );
+    }
+    p.push_str(&format!(
+        "\n## Marking elements\nMark every meaningful region of the page (header, nav, each \
+         card or panel, key controls — the pieces a user would want to praise or reject \
+         individually, at most {MAX_ELEMENTS}) by putting BOTH attributes on its outermost \
+         tag:\n\
+         - data-uig-id: a unique kebab-case id, e.g. \"metric-cards\"\n\
+         - data-uig-label: a short human label, e.g. \"Metric summary cards\"\n\n\
+         ## Submitting\nSubmit EXACTLY ONE result by calling the ui_gauge_submit_page tool \
+         with:\n\
+         - html: the complete HTML document (≤ {HTML_MAX_LEN} chars)\n\
+         - elements: the full list of marked elements as {{id, label, kind}} — it must match \
+         the data-uig-id attributes in the html exactly\n\
+         - name: a short title for the page\n\
+         - design_notes: 2-4 sentences on the design direction you chose and why\n\
+         Do not ask questions; do not produce anything else.",
+    ));
     p
 }
 
-// ── Generation state (engine/generation) ────────────────────────
+// ── Generation state (engine/generation) ──────────────────────────────
 
 pub fn generation_state() -> Value {
     store_get(ENGINE_COLLECTION, "generation")
@@ -438,138 +508,216 @@ pub fn generation_state() -> Value {
 pub fn set_generation_state(v: Value) {
     let _ = store_put(ENGINE_COLLECTION, "generation", v);
 }
+
+/// One-time sweep of the 0.2.x collections (rubric/baselines/evaluations) —
+/// the 0.3.0 model replaces them wholesale. Runs from `timer.tick` once.
+pub fn sweep_legacy_collections() {
+    let marker = "swept_v3";
+    if store_get(ENGINE_COLLECTION, marker)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+    for coll in [
+        "categories",
+        "baselines",
+        "baseline_images",
+        "baseline_html",
+        "evaluations",
+    ] {
+        for (k, _) in store_list(coll).unwrap_or_default() {
+            store_delete(coll, &k);
+        }
+    }
+    let _ = store_put(ENGINE_COLLECTION, marker, json!({ "at": clock() }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
-    fn cat(key: &str, over: Option<u8>) -> Category {
-        Category {
-            key: key.into(),
-            label: key.into(),
-            bar_override: over,
+    fn page(id: &str, name: &str, elems: &[(&str, &str)]) -> Page {
+        Page {
+            id: id.into(),
+            name: name.into(),
+            brief: String::new(),
+            model: String::new(),
+            design_notes: String::new(),
+            created_at: id.into(),
+            elements: elems
+                .iter()
+                .map(|(eid, label)| PageElement {
+                    id: eid.to_string(),
+                    label: label.to_string(),
+                    kind: String::new(),
+                })
+                .collect(),
         }
     }
-    fn base(scores: &[(&str, u8)]) -> Baseline {
-        Baseline {
-            id: "b".into(),
-            name: "b".into(),
-            notes: String::new(),
-            scores: scores.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-            mime_type: "image/png".into(),
-            created_at: String::new(),
-            kind: "image".into(),
-            change_prompt: String::new(),
-        }
-    }
 
-    #[test]
-    fn bar_prefers_override_then_median_then_default() {
-        let c = cat("typography", Some(9));
-        assert_eq!(bar_for(&c, &[]), 9);
-        let c = cat("typography", None);
-        assert_eq!(bar_for(&c, &[]), DEFAULT_BAR);
-        let bs = vec![
-            base(&[("typography", 4)]),
-            base(&[("typography", 8)]),
-            base(&[("typography", 6)]),
-        ];
-        assert_eq!(bar_for(&c, &bs), 6, "odd count → true median");
-        let bs = vec![base(&[("typography", 4)]), base(&[("typography", 8)])];
-        assert_eq!(bar_for(&c, &bs), 4, "even count → lower median");
-    }
-
-    #[test]
-    fn judge_flags_below_bar_missing_and_unknown() {
-        let cats = vec![cat("a", Some(7)), cat("b", Some(5))];
-        let mut scores = BTreeMap::new();
-        scores.insert("a".to_string(), 8u8);
-        // "b" missing → gap at 0.
-        let gaps = judge(&scores, &cats, &[]).unwrap();
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0].category, "b");
-        assert_eq!(gaps[0].score, 0);
-        scores.insert("b".to_string(), 5u8);
-        assert!(
-            judge(&scores, &cats, &[]).unwrap().is_empty(),
-            "at bar passes"
-        );
-        scores.insert("zzz".to_string(), 3u8);
-        assert!(
-            judge(&scores, &cats, &[]).is_err(),
-            "unknown category rejected"
-        );
-    }
-
-    #[test]
-    fn default_categories_cover_the_six() {
-        let cats = default_categories();
-        assert_eq!(cats.len(), 6);
-        assert!(cats.iter().any(|c| c.key == "accessibility"));
-    }
-
-    fn generated(change: &str, scores: &[(&str, u8)], ts: &str) -> Baseline {
-        Baseline {
-            id: ts.into(),
-            name: "gen".into(),
-            notes: String::new(),
-            scores: scores.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-            mime_type: String::new(),
-            created_at: ts.into(),
-            kind: "generated".into(),
-            change_prompt: change.into(),
+    fn fb(
+        page_id: &str,
+        element_id: &str,
+        verdict: &str,
+        comment: &str,
+        starred: bool,
+    ) -> Feedback {
+        Feedback {
+            page_id: page_id.into(),
+            element_id: element_id.into(),
+            verdict: verdict.into(),
+            comment: comment.into(),
+            starred,
+            star_dismissed: false,
+            updated_at: String::new(),
         }
     }
 
     #[test]
-    fn avg_score_none_until_rated() {
-        let b = generated("x", &[], "1");
-        assert!(b.avg_score().is_none());
-        let b = generated("x", &[("a", 6), ("b", 9)], "1");
-        assert_eq!(b.avg_score(), Some(7.5));
+    fn validate_accepts_a_marked_page() {
+        let elems = vec![PageElement {
+            id: "hero".into(),
+            label: "Hero".into(),
+            kind: String::new(),
+        }];
+        let html =
+            "<html><body><div data-uig-id=\"hero\" data-uig-label=\"Hero\">x</div></body></html>";
+        assert!(validate_submission(html, &elems).is_ok());
     }
 
     #[test]
-    fn overall_prompt_keeps_only_high_rated_generated_changes() {
-        let bs = vec![
-            generated("tighter spacing", &[("a", 8), ("b", 8)], "1"), // 8.0 → in
-            generated("neon palette", &[("a", 3), ("b", 4)], "2"),    // 3.5 → out
-            generated("bigger type scale", &[], "3"),                 // unrated → out
-            base(&[("a", 10)]),                                       // image kind → out
-        ];
-        let p = overall_prompt(&bs);
-        assert!(p.contains("tighter spacing"), "{p}");
-        assert!(p.contains("[rated 8.0/10]"), "{p}");
-        assert!(!p.contains("neon palette"), "{p}");
-        assert!(!p.contains("bigger type scale"), "{p}");
-    }
-
-    #[test]
-    fn overall_prompt_updates_when_a_rating_changes() {
-        let mut bs = vec![generated("card shadows", &[("a", 5)], "1")];
-        assert!(!overall_prompt(&bs).contains("card shadows"));
-        bs[0].scores.insert("a".into(), 9);
+    fn validate_rejects_scripts_missing_ids_and_duplicates() {
+        let el = |id: &str| PageElement {
+            id: id.into(),
+            label: "L".into(),
+            kind: String::new(),
+        };
+        let html = "<html><body><div data-uig-id=\"a\">x</div></body></html>";
+        assert!(validate_submission(html, &[el("a")]).is_ok());
         assert!(
-            overall_prompt(&bs).contains("card shadows"),
-            "re-rating must refresh"
+            validate_submission("<html><script>x</script></html>", &[el("a")]).is_err(),
+            "script must be rejected"
         );
-        bs.clear();
-        assert!(overall_prompt(&bs).contains("No validated directives"));
+        assert!(
+            validate_submission(html, &[el("b")]).is_err(),
+            "id not present in html"
+        );
+        assert!(
+            validate_submission(html, &[el("a"), el("a")]).is_err(),
+            "duplicate ids"
+        );
+        assert!(
+            validate_submission(html, &[el("_page")]).is_err(),
+            "reserved id"
+        );
+        assert!(validate_submission(html, &[]).is_err(), "no elements");
     }
 
     #[test]
-    fn generation_prompt_carries_overall_avoid_and_contract() {
-        let bs = vec![
-            generated("tighter spacing", &[("a", 8)], "1"),
-            generated("neon palette", &[("a", 2)], "2"),
-            generated("glass morphism", &[], "3"),
+    fn preference_prompt_sorts_feedback_into_sections() {
+        let pages = vec![page(
+            "p1",
+            "Dashboard",
+            &[("hero", "Hero"), ("nav", "Sidebar nav")],
+        )];
+        let feedback = vec![
+            fb("p1", "hero", "up", "bold type, lots of whitespace", false),
+            fb("p1", "nav", "down", "too cramped", false),
+            fb("p1", "_page", "", "overall direction is right", false),
         ];
-        let p = build_generation_prompt(&bs);
-        assert!(p.contains("tighter spacing"), "{p}");
-        assert!(p.contains("avoid repeating"), "{p}");
-        assert!(p.contains("neon palette"), "{p}");
-        assert!(p.contains("still unrated"), "{p}");
-        assert!(p.contains("ui_gauge_submit_baseline"), "{p}");
-        assert!(p.contains("change_summary"), "{p}");
+        let pref = preference_prompt(&pages, &feedback, &BTreeSet::new());
+        assert!(pref.text.contains("### Do"), "{}", pref.text);
+        assert!(pref.text.contains("bold type"), "{}", pref.text);
+        assert!(pref.text.contains("### Avoid"), "{}", pref.text);
+        assert!(pref.text.contains("too cramped"), "{}", pref.text);
+        assert!(pref.text.contains("whole page"), "{}", pref.text);
+        assert!(!pref.text.contains("Visual references"), "{}", pref.text);
+        assert_eq!(pref.ingredients.len(), 3);
+    }
+
+    #[test]
+    fn starred_elements_become_references_only_with_a_shot() {
+        let pages = vec![page("p1", "Dashboard", &[("hero", "Hero")])];
+        let feedback = vec![fb("p1", "hero", "up", "", true)];
+        let none = preference_prompt(&pages, &feedback, &BTreeSet::new());
+        assert!(!none.text.contains("Visual references"), "{}", none.text);
+        let mut shots = BTreeSet::new();
+        shots.insert("p1:hero".to_string());
+        let some = preference_prompt(&pages, &feedback, &shots);
+        assert!(some.text.contains("Visual references"), "{}", some.text);
+        assert!(
+            some.text.contains("ui_gauge_reference_image"),
+            "{}",
+            some.text
+        );
+        assert!(some.text.contains("id \"p1:hero\""), "{}", some.text);
+    }
+
+    #[test]
+    fn preference_prompt_updates_when_feedback_changes() {
+        let pages = vec![page("p1", "Dashboard", &[("hero", "Hero")])];
+        let mut feedback = vec![fb("p1", "hero", "up", "keep this", false)];
+        assert!(
+            preference_prompt(&pages, &feedback, &BTreeSet::new())
+                .text
+                .contains("keep this")
+        );
+        feedback[0].verdict = "down".into();
+        let p = preference_prompt(&pages, &feedback, &BTreeSet::new());
+        assert!(p.text.contains("### Avoid"), "{}", p.text);
+        assert!(!p.text.contains("### Do\n- Hero"), "{}", p.text);
+    }
+
+    #[test]
+    fn session_block_is_none_until_there_is_feedback() {
+        let pages = vec![page("p1", "Dashboard", &[("hero", "Hero")])];
+        let empty = preference_prompt(&pages, &[], &BTreeSet::new());
+        assert!(session_block(&empty).is_none());
+        let with = preference_prompt(
+            &pages,
+            &[fb("p1", "hero", "up", "", false)],
+            &BTreeSet::new(),
+        );
+        assert!(session_block(&with).is_some());
+    }
+
+    #[test]
+    fn stale_feedback_for_removed_elements_is_ignored() {
+        let pages = vec![page("p1", "Dashboard", &[("hero", "Hero")])];
+        let feedback = vec![fb("p1", "gone", "up", "orphan", false)];
+        let pref = preference_prompt(&pages, &feedback, &BTreeSet::new());
+        assert!(pref.ingredients.is_empty(), "{}", pref.text);
+    }
+
+    #[test]
+    fn generation_prompt_carries_brief_taste_history_and_contract() {
+        let pages = vec![page("p1", "Dashboard", &[("hero", "Hero")])];
+        let feedback = vec![
+            fb("p1", "hero", "up", "bold type", false),
+            fb("p1", "hero", "down", "", false),
+        ];
+        let p = build_generation_prompt("a settings page", &pages, &feedback);
+        assert!(p.contains("a settings page"), "{p}");
+        assert!(p.contains("bold type"), "{p}");
+        assert!(p.contains("Previously generated pages"), "{p}");
+        assert!(p.contains("Dashboard"), "{p}");
+        assert!(p.contains("data-uig-id"), "{p}");
+        assert!(p.contains("data-uig-label"), "{p}");
+        assert!(p.contains("ui_gauge_submit_page"), "{p}");
+        assert!(p.contains("design_notes"), "{p}");
+
+        let free = build_generation_prompt("  ", &pages, &feedback);
+        assert!(free.contains("No brief was given"), "{free}");
+    }
+
+    #[test]
+    fn clip_truncates_long_comments() {
+        assert_eq!(clip("  hi  ", 10), "hi");
+        let long = "x".repeat(400);
+        let c = clip(&long, 300);
+        assert!(c.chars().count() == 301 && c.ends_with('…'));
     }
 }

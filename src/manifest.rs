@@ -18,81 +18,72 @@ pub fn manifest_json() -> String {
         "concurrency": 4,
         "hooks": [
             "mcp.tool.invoke",
-            // Clock only — wasm has no time source; evaluations are stamped
+            // Clock only — wasm has no time source; records are stamped
             // with the last tick's timestamp.
             "timer.tick",
             // Marks a generation session that ended without submitting.
             "session.agent.ended",
+            // Keeps each chat session's UI-taste block in sync with its
+            // folder's toggle (see prompt_sync.rs).
+            "session.message.before",
             "http.request.before",
             "http.request.authed",
         ],
 
         "mcp_tools": [
             {
-                "name": "ui_gauge_rubric",
-                "title": "UI-gauge rubric + calibration anchors",
-                "description": "The user's UI design rubric: categories with their 1-10 bars, the user's ranked baselines (scores + notes + change prompts; fetch images with ui_gauge_baseline_image), and the OVERALL BASELINE PROMPT — the style directives the user has validated by rating generated baselines high. Call this BEFORE scoring any UI so your numbers sit on the user's calibrated scale, and apply the overall prompt whenever you BUILD UI for this user.",
-                "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }
-            },
-            {
-                "name": "ui_gauge_baseline_image",
-                "title": "Fetch one baseline image",
-                "description": "One user-ranked baseline screenshot (base64 + mime type), for calibrating your scoring against the user's scale. Fetch one or two anchors near the bar rather than all of them.",
+                "name": "ui_gauge_submit_page",
+                "title": "Submit a generated UI page",
+                "description": "Submit ONE generated UI page: a complete self-contained HTML document (all CSS inline, no JavaScript, no external resources, max 180000 chars) whose meaningful regions each carry data-uig-id (unique kebab-case) and data-uig-label (short human label) attributes, plus the matching elements list and short design_notes. The user reviews it element by element on the UI Gauge page; their feedback becomes the UI preference prompt future sessions receive. Used by the page's Generate sessions; callable by any agent asked to produce a ui-gauge page.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "id": { "type": "string", "description": "Baseline id from ui_gauge_rubric." }
+                        "html": { "type": "string", "description": "The complete HTML document (inline CSS, no JS, ≤180000 chars, data-uig-id/data-uig-label on every marked element)." },
+                        "elements": {
+                            "type": "array",
+                            "description": "Every marked element, matching the data-uig-id attributes exactly (max 40).",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "The element's data-uig-id (kebab-case, unique)." },
+                                    "label": { "type": "string", "description": "Short human label, e.g. \"Metric summary cards\"." },
+                                    "kind": { "type": "string", "description": "Optional coarse kind: header, nav, card, form, table, …" }
+                                },
+                                "required": ["id", "label"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "name": { "type": "string", "description": "Short title for the page." },
+                        "design_notes": { "type": "string", "description": "2-4 sentences on the chosen design direction." }
+                    },
+                    "required": ["html", "elements", "name"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "ui_gauge_prefs",
+                "title": "The user's UI preference prompt",
+                "description": "The composed UI taste profile: Do/Avoid directives distilled from the user's per-element feedback on generated pages, plus the list of starred reference screenshots (fetch with ui_gauge_reference_image). Sessions in a folder where the user enabled the prompt already receive it automatically; call this when you want it explicitly (e.g. from a worker) or to check the current state before building UI.",
+                "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }
+            },
+            {
+                "name": "ui_gauge_reference_image",
+                "title": "Fetch one UI reference screenshot",
+                "description": "One starred element's screenshot (base64 + mime type) — the user marked it as a visual reference for how UI should look. Ids come from ui_gauge_prefs or the injected UI-taste prompt. Fetch one or two relevant references before designing similar UI, not all of them.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Reference id, e.g. \"page-…:metric-cards\"." }
                     },
                     "required": ["id"],
                     "additionalProperties": false
                 }
             },
             {
-                "name": "ui_gauge_score",
-                "title": "Score a UI against the baselines",
-                "description": "Submit your 1-10 per-category scores for a target UI (a page, screen, or change). Every category from ui_gauge_rubric must be scored — unscored counts as 0. Categories below their bar make the verdict 'subpar' and automatically create one follow-up card per gap in the caller's project; the evaluation lands in the UI Gauge page history either way.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "target": { "type": "string", "description": "What was scored, e.g. \"settings page after redesign\"." },
-                        "scores": {
-                            "type": "object",
-                            "description": "category_key → integer 1-10, on the user's calibrated scale.",
-                            "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 10 }
-                        },
-                        "notes": { "type": "string", "description": "Short evaluator notes — what dragged scores down; copied into follow-up cards." }
-                    },
-                    "required": ["target", "scores"],
-                    "additionalProperties": false
-                }
-            },
-            {
                 "name": "ui_gauge_history",
-                "title": "Past UI-gauge evaluations",
-                "description": "Recent evaluations (newest first, max 25), optionally filtered by target substring-exact match. Use it to check whether a re-evaluation improved on the last one.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "target": { "type": "string", "description": "Optional exact target to filter by." }
-                    },
-                    "required": [],
-                    "additionalProperties": false
-                }
-            },
-            {
-                "name": "ui_gauge_submit_baseline",
-                "title": "Submit a generated baseline UI",
-                "description": "Submit ONE generated baseline UI iteration: a complete self-contained HTML document (all CSS inline, no JavaScript, no external resources, max 180000 chars) plus a change_summary — one short paragraph describing WHAT changed vs the previous baselines, written as a reusable style directive. The user rates the result 1-10 per category on the UI Gauge page; an average of 7+ folds your change_summary into the user's overall baseline prompt. Used by the page's Generate-baseline sessions; callable by any agent iterating on baseline UI.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "html": { "type": "string", "description": "The complete HTML document (inline CSS, no JS, ≤180000 chars)." },
-                        "change_summary": { "type": "string", "description": "What this iteration changed vs previous baselines and why — phrased as a reusable style directive." },
-                        "name": { "type": "string", "description": "Short title for this iteration." }
-                    },
-                    "required": ["html", "change_summary"],
-                    "additionalProperties": false
-                }
+                "title": "Generated pages + user feedback",
+                "description": "Generated UI pages (newest first, max 25) with the user's per-element feedback: verdicts, comments, stars. Use it to see what was already tried and how the user reacted before generating or proposing new UI.",
+                "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }
             }
         ],
 
@@ -103,23 +94,24 @@ pub fn manifest_json() -> String {
         "ui_routes": [
             "GET /api/plugin-ui/ui-gauge/state",
             "GET /api/plugin-ui/ui-gauge/pickers",
-            "POST /api/plugin-ui/ui-gauge/categories",
             "POST /api/plugin-ui/ui-gauge/generate",
-            "POST /api/plugin-ui/ui-gauge/baselines",
-            "POST /api/plugin-ui/ui-gauge/baselines/:id",
-            "POST /api/plugin-ui/ui-gauge/baselines/:id/delete",
-            "GET /api/plugin-ui/ui-gauge/baselines/:id/image",
-            "GET /api/plugin-ui/ui-gauge/baselines/:id/html"
+            "POST /api/plugin-ui/ui-gauge/feedback",
+            "POST /api/plugin-ui/ui-gauge/shots",
+            "POST /api/plugin-ui/ui-gauge/folders",
+            "GET /api/plugin-ui/ui-gauge/pages/:id/html",
+            "POST /api/plugin-ui/ui-gauge/pages/:id/delete",
+            "GET /api/plugin-ui/ui-gauge/shots/:id"
         ],
 
         "permissions": [
             "provide_mcp_tools",
-            "data_store",          // rubric, baselines, generated html, history
-            "user_authority",      // authed page routes
-            "contribute_sidebar",  // the UI Gauge sidebar entry
-            "session_write",       // create the temp generation session
-            "session_dispatch",    // hand it the generation prompt
-            "models_read"          // the model picker
+            "data_store",            // pages, feedback, screenshots, folder toggles
+            "user_authority",        // authed page routes
+            "contribute_sidebar",    // the UI Gauge sidebar entry
+            "session_write",         // create the temp generation session
+            "session_dispatch",      // hand it the generation prompt
+            "session_prompt_write",  // attach the UI-taste block to sessions
+            "models_read"            // the model picker
         ],
     });
     manifest.to_string()
@@ -130,7 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_declares_tools_and_page() {
+    fn manifest_declares_tools_hooks_and_page() {
         let m: serde_json::Value = serde_json::from_str(&manifest_json()).unwrap();
         let tools: Vec<&str> = m["mcp_tools"]
             .as_array()
@@ -139,14 +131,14 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .collect();
         for t in [
-            "ui_gauge_rubric",
-            "ui_gauge_baseline_image",
-            "ui_gauge_score",
+            "ui_gauge_submit_page",
+            "ui_gauge_prefs",
+            "ui_gauge_reference_image",
             "ui_gauge_history",
-            "ui_gauge_submit_baseline",
         ] {
             assert!(tools.contains(&t), "missing tool {t}");
         }
+        assert_eq!(tools.len(), 4, "old scoring tools must be gone");
         assert_eq!(m["sidebar_items"][0]["path"], "/plugin-api/v1/ui-gauge");
         let hooks: Vec<&str> = m["hooks"]
             .as_array()
@@ -154,7 +146,15 @@ mod tests {
             .iter()
             .filter_map(|h| h.as_str())
             .collect();
+        assert!(hooks.contains(&"session.message.before"));
         assert!(hooks.contains(&"timer.tick"));
         assert!(hooks.contains(&"http.request.authed"));
+        let perms: Vec<&str> = m["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect();
+        assert!(perms.contains(&"session_prompt_write"));
     }
 }
